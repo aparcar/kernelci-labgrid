@@ -1,0 +1,111 @@
+# KernelCI Labgrid Agent - Complete Docker Compose Example
+#
+# This sets up everything needed to run OpenWrt tests on QEMU x86_64:
+# - Labgrid coordinator (manages device resources)
+# - Labgrid exporter (provides QEMU devices)
+# - KernelCI Labgrid agent (polls for jobs, runs tests)
+#
+# Usage:
+#   # Start everything
+#   docker compose up -d
+#
+#   # View logs
+#   docker compose logs -f labgrid-agent
+#
+#   # Stop
+#   docker compose down
+
+services:
+  # ==========================================================================
+  # Labgrid Coordinator - manages device resources and locks
+  # ==========================================================================
+  labgrid-coordinator:
+    image: labgrid/labgrid:latest
+    container_name: labgrid-coordinator
+    command: labgrid-coordinator
+    ports:
+      - "20408:20408"
+    volumes:
+      - coordinator-data:/var/lib/labgrid
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.connect(('localhost', 20408)); s.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ==========================================================================
+  # Labgrid Exporter - exports QEMU devices to the coordinator
+  # ==========================================================================
+  labgrid-exporter:
+    image: labgrid/labgrid:latest
+    container_name: labgrid-exporter
+    command: labgrid-exporter /etc/labgrid/exporter.yaml
+    depends_on:
+      labgrid-coordinator:
+        condition: service_healthy
+    environment:
+      - LG_COORDINATOR=labgrid-coordinator:20408
+    volumes:
+      - ./exporter.yaml:/etc/labgrid/exporter.yaml:ro
+      - ./scripts:/opt/scripts:ro
+      - artifacts:/artifacts
+      # For QEMU - needs KVM access
+      - /dev/kvm:/dev/kvm
+    devices:
+      - /dev/kvm:/dev/kvm
+    privileged: true
+    restart: unless-stopped
+
+  # ==========================================================================
+  # KernelCI Labgrid Agent - polls for jobs and runs tests
+  # ==========================================================================
+  labgrid-agent:
+    build:
+      context: ../..
+      dockerfile: examples/docker/Dockerfile
+    container_name: labgrid-agent
+    depends_on:
+      labgrid-coordinator:
+        condition: service_healthy
+    environment:
+      - KCI_API_URL=${KCI_API_URL:-https://api.kernelci.org}
+      - KCI_API_TOKEN=${KCI_API_TOKEN:?KCI_API_TOKEN is required}
+      - LG_COORDINATOR=labgrid-coordinator:20408
+    volumes:
+      - ./targets:/opt/tests/targets:ro
+      - ./tests:/opt/tests/tests:ro
+      - ./health_checks:/etc/labgrid/health_checks:ro
+      - artifacts:/artifacts
+      - health-state:/var/lib/labgrid
+    command: >
+      labgrid-agent
+        --lab-name ${LAB_NAME:-openwrt-qemu-lab}
+        --tests-dir /opt/tests/tests
+        --targets-dir /opt/tests/targets
+        --artifact-dir /artifacts
+        --health-checks-dir /etc/labgrid/health_checks
+        --health-state-file /var/lib/labgrid/health_state.json
+        --poll-interval 30
+        --debug
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Optional: OpenWrt image builder (for creating test images)
+  # ==========================================================================
+  # openwrt-imagebuilder:
+  #   image: openwrt/imagebuilder:x86-64-openwrt-24.10.0
+  #   container_name: openwrt-imagebuilder
+  #   volumes:
+  #     - images:/images
+  #   command: ["sleep", "infinity"]  # Keep alive for manual builds
+
+volumes:
+  coordinator-data:
+  artifacts:
+  health-state:
+  # images:
+
+networks:
+  default:
+    name: labgrid-network

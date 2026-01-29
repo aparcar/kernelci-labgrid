@@ -1,0 +1,11 @@
+# Health Check: OpenWrt 25.12 Branch QEMU x86_64
+device: openwrt-2512-x86
+target: openwrt-2512-x86.yaml
+frequency_hours: 24
+
+# Use 25.12 snapshot images for health checks
+golden_image:
+  rootfs: https://downloads.openwrt.org/releases/25.12-SNAPSHOT/targets/x86/64/openwrt-25.12-snapshot-x86-64-generic-squashfs-combined-efi.img.gz
+
+test_path: health/test_boot.py
+timeout: 300

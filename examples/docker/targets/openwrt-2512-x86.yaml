@@ -1,0 +1,50 @@
+# Labgrid Target: OpenWrt 25.12 Branch on QEMU x86_64
+#
+# Environment variables (set by labgrid-agent):
+#   LG_KERNEL  - Path to kernel (bzImage)
+#   LG_ROOTFS  - Path to rootfs (combined image or rootfs.img)
+
+targets:
+  main:
+    resources:
+      RemotePlace:
+        name: openwrt-2512-x86
+
+    drivers:
+      QEMUDriver:
+        qemu_bin: qemu-system-x86_64
+        machine: pc
+        cpu: host
+        memory: 512M
+        disk: !template "$LG_ROOTFS"
+        extra_args: >-
+          -enable-kvm
+          -nographic
+          -serial mon:stdio
+          -netdev user,id=wan,hostfwd=tcp::2223-:22
+          -device virtio-net-pci,netdev=wan
+
+      ShellDriver:
+        prompt: 'root@OpenWrt:.*#'
+        login_prompt: 'login:'
+        username: root
+        login_timeout: 120
+        console_ready: 'Please press Enter to activate this console'
+
+      SSHDriver:
+        host: localhost
+        port: 2223
+        username: root
+        password: ""
+
+options:
+  # Test configuration
+  branch: openwrt-25.12
+  platform: x86_64
+
+  # OpenWrt specifics
+  openwrt_target: x86
+  openwrt_subtarget: "64"
+
+  # URLs for 25.12 branch images
+  image_base_url: "https://downloads.openwrt.org/releases/25.12-SNAPSHOT/targets/x86/64/"

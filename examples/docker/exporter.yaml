@@ -1,0 +1,55 @@
+# Labgrid Exporter Configuration
+#
+# This exports two QEMU x86_64 places:
+# - openwrt-main-x86: For testing OpenWrt main branch
+# - openwrt-2512-x86: For testing OpenWrt 25.12 branch
+
+# =============================================================================
+# OpenWrt Main Branch - QEMU x86_64
+# =============================================================================
+openwrt-main-x86:
+  location: "qemu-slot-1"
+
+  QEMUDriver:
+    qemu_bin: qemu-system-x86_64
+    machine: pc
+    cpu: host
+    memory: 512M
+    extra_args: >-
+      -enable-kvm
+      -nographic
+      -serial mon:stdio
+      -netdev user,id=wan,hostfwd=tcp::2222-:22
+      -device virtio-net-pci,netdev=wan
+      -netdev user,id=lan
+      -device virtio-net-pci,netdev=lan
+
+  NetworkService:
+    address: localhost
+    username: root
+    password: ""
+
+# =============================================================================
+# OpenWrt 25.12 Branch - QEMU x86_64
+# =============================================================================
+openwrt-2512-x86:
+  location: "qemu-slot-2"
+
+  QEMUDriver:
+    qemu_bin: qemu-system-x86_64
+    machine: pc
+    cpu: host
+    memory: 512M
+    extra_args: >-
+      -enable-kvm
+      -nographic
+      -serial mon:stdio
+      -netdev user,id=wan,hostfwd=tcp::2223-:22
+      -device virtio-net-pci,netdev=wan
+      -netdev user,id=lan
+      -device virtio-net-pci,netdev=lan
+
+  NetworkService:
+    address: localhost
+    username: root
+    password: ""

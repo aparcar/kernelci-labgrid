@@ -1,0 +1,11 @@
+# Health Check: OpenWrt Main Branch QEMU x86_64
+device: openwrt-main-x86
+target: openwrt-main-x86.yaml
+frequency_hours: 24
+
+# Use latest snapshot images for health checks
+golden_image:
+  rootfs: https://downloads.openwrt.org/snapshots/targets/x86/64/openwrt-x86-64-generic-squashfs-combined-efi.img.gz
+
+test_path: health/test_boot.py
+timeout: 300
