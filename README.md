@@ -30,7 +30,6 @@ A single daemon that connects your Labgrid test lab to KernelCI. Runs locally in
 │   │  3. Download artifacts (kernel, rootfs)              │    │
 │   │  4. pytest --lg-env targets/xxx.yaml tests/          │    │
 │   │  5. Report results back to API                       │    │
-│   │  6. Send email notifications on device failures      │    │
 │   └───────────────────────────┬───────────────────────────┘    │
 │                               │                                 │
 │                               │ runs your tests                 │
@@ -93,8 +92,7 @@ labgrid-agent \
     --lab-name my-lab \
     --tests-dir /path/to/openwrt-tests/tests \
     --health-checks-dir /etc/labgrid/health_checks \
-    --health-state-file /var/lib/labgrid/health_state.json \
-    --smtp-host smtp.example.com
+    --health-state-file /var/lib/labgrid/health_state.json
 ```
 
 ### Options
@@ -110,11 +108,6 @@ labgrid-agent \
 | `--artifact-dir`, `-a` | Where to download artifacts |
 | `--health-checks-dir`, `-c` | Directory with health check YAML configs (enables health checks) |
 | `--health-state-file`, `-s` | JSON file to persist device health state |
-| `--smtp-host` | SMTP server for notifications |
-| `--smtp-port` | SMTP port (default: 587) |
-| `--smtp-user` | SMTP username |
-| `--smtp-password` | SMTP password |
-| `--smtp-from` | From address for emails |
 | `--debug`, `-d` | Enable debug logging |
 
 ### Environment Variables
@@ -125,12 +118,6 @@ KCI_API_TOKEN=your-token
 LG_KERNEL=/path/to/kernel      # Set by agent, available in tests
 LG_ROOTFS=/path/to/rootfs      # Set by agent, available in tests
 LG_DTB=/path/to/dtb            # Set by agent, available in tests
-
-# For email notifications
-SMTP_HOST=smtp.example.com
-SMTP_USER=username
-SMTP_PASSWORD=password
-SMTP_FROM=labgrid@example.com
 ```
 
 ## How It Works
@@ -149,7 +136,7 @@ SMTP_FROM=labgrid@example.com
 
 ## Health Checks
 
-Similar to LAVA, the agent can run periodic health checks to validate your devices are working correctly. Health checks run a golden image at regular intervals and notify maintainers when devices fail.
+Similar to LAVA, the agent can run periodic health checks to validate your devices are working correctly. Health checks run a golden image at regular intervals.
 
 ### Health Check Configuration
 
@@ -167,12 +154,6 @@ golden_image:
 
 test_path: tests/health/test_boot.py
 timeout: 600
-
-notifications:
-  emails:
-    - lab-admin@example.com
-  on_failure: true
-  on_recovery: true
 ```
 
 ### Device Health States
@@ -237,8 +218,6 @@ After=network-online.target
 Type=simple
 User=labgrid
 Environment="KCI_API_TOKEN=your-token"
-Environment="SMTP_HOST=smtp.example.com"
-Environment="SMTP_FROM=labgrid@example.com"
 ExecStart=/usr/local/bin/labgrid-agent \
     --lab-name my-lab \
     --tests-dir /opt/openwrt-tests/tests \

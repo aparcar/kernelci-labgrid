@@ -6,7 +6,6 @@ A single daemon that:
 3. Downloads kernel/rootfs artifacts
 4. Runs pytest with labgrid (your existing tests)
 5. Reports results back to KernelCI API
-6. Sends email notifications when devices fail health checks
 
 No modifications needed to KernelCI infrastructure.
 """
@@ -19,13 +18,10 @@ import logging
 import os
 import shutil
 import signal
-import smtplib
 import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any
 
@@ -109,7 +105,6 @@ class HealthCheckConfig:
     golden_image: dict[str, str] = field(default_factory=dict)
     test_path: str = ""  # specific test file, empty = all tests
     timeout: int = 3600
-    notifications: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_yaml(cls, path: Path) -> "HealthCheckConfig":
@@ -124,7 +119,6 @@ class HealthCheckConfig:
             golden_image=data.get("golden_image", {}),
             test_path=data.get("test_path", ""),
             timeout=data.get("timeout", 3600),
-            notifications=data.get("notifications", {}),
         )
 
 
@@ -160,12 +154,6 @@ class LabgridAgent:
         # Health check options
         health_checks_dir: str | Path | None = None,
         health_state_file: str | Path | None = None,
-        # SMTP options for notifications
-        smtp_host: str | None = None,
-        smtp_port: int = 587,
-        smtp_user: str | None = None,
-        smtp_password: str | None = None,
-        smtp_from: str | None = None,
     ):
         """Initialize the agent.
 
@@ -180,11 +168,6 @@ class LabgridAgent:
             default_timeout: Default test timeout in seconds
             health_checks_dir: Directory with health check YAML configs (optional)
             health_state_file: JSON file to persist device health state
-            smtp_host: SMTP server for notifications
-            smtp_port: SMTP port
-            smtp_user: SMTP username
-            smtp_password: SMTP password
-            smtp_from: From address for emails
         """
         self.api_url = api_url.rstrip("/")
         self.api_token = api_token
@@ -198,13 +181,6 @@ class LabgridAgent:
         # Health check configuration
         self.health_checks_dir = Path(health_checks_dir) if health_checks_dir else None
         self.health_state_file = Path(health_state_file) if health_state_file else None
-
-        # SMTP configuration
-        self.smtp_host = smtp_host or os.environ.get("SMTP_HOST")
-        self.smtp_port = smtp_port
-        self.smtp_user = smtp_user or os.environ.get("SMTP_USER")
-        self.smtp_password = smtp_password or os.environ.get("SMTP_PASSWORD")
-        self.smtp_from = smtp_from or os.environ.get("SMTP_FROM", "labgrid@localhost")
 
         # Runtime state
         self._session: aiohttp.ClientSession | None = None
@@ -358,7 +334,6 @@ class LabgridAgent:
     async def _run_health_check(self, device: str, config: HealthCheckConfig) -> None:
         """Run a health check for a device."""
         health = self._device_health.get(device, DeviceHealth(device=device))
-        previous_state = health.state
 
         try:
             # Download golden image artifacts
@@ -384,43 +359,19 @@ class LabgridAgent:
                 health.last_success = datetime.now()
                 health.failure_count = 0
                 health.failure_reason = ""
-
                 logger.info(f"Health check PASSED for {device}")
-
-                # Notify on recovery
-                if previous_state == "bad" and config.notifications.get("on_recovery"):
-                    await self._send_notification(
-                        config, device, recovered=True,
-                        message=f"Device {device} has recovered and passed health check"
-                    )
             else:
                 health.state = "bad"
                 health.failure_count += 1
                 health.failure_reason = result.output[:500] if result.output else "Test failed"
-
-                logger.warning(f"Health check FAILED for {device}")
-
-                # Notify on failure
-                if config.notifications.get("on_failure", True):
-                    await self._send_notification(
-                        config, device, recovered=False,
-                        message=f"Device {device} failed health check",
-                        details=result.output,
-                    )
+                logger.warning(f"Health check FAILED for {device}: {health.failure_reason}")
 
         except Exception as e:
             health.last_check = datetime.now()
             health.state = "bad"
             health.failure_count += 1
             health.failure_reason = str(e)
-
             logger.exception(f"Health check error for {device}")
-
-            if config.notifications.get("on_failure", True):
-                await self._send_notification(
-                    config, device, recovered=False,
-                    message=f"Device {device} health check error: {e}",
-                )
 
         self._device_health[device] = health
         self._save_health_state()
@@ -453,56 +404,6 @@ class LabgridAgent:
                 logger.error(f"Failed to download {name}: {e}")
 
         return artifacts
-
-    async def _send_notification(
-        self,
-        config: HealthCheckConfig,
-        device: str,
-        recovered: bool,
-        message: str,
-        details: str = "",
-    ) -> None:
-        """Send email notification."""
-        emails = config.notifications.get("emails", [])
-        if not emails:
-            return
-
-        if not self.smtp_host:
-            logger.warning("SMTP not configured, skipping notification")
-            return
-
-        subject = f"[Labgrid] Device {device} {'RECOVERED' if recovered else 'FAILED'}"
-
-        body = f"""Health Check Notification
-========================
-
-Device: {device}
-Status: {'RECOVERED' if recovered else 'FAILED'}
-Time: {datetime.now().isoformat()}
-
-{message}
-"""
-
-        if details:
-            body += f"\nDetails:\n--------\n{details[:2000]}\n"
-
-        try:
-            msg = MIMEMultipart()
-            msg["From"] = self.smtp_from
-            msg["To"] = ", ".join(emails)
-            msg["Subject"] = subject
-            msg.attach(MIMEText(body, "plain"))
-
-            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
-                if self.smtp_user and self.smtp_password:
-                    server.starttls()
-                    server.login(self.smtp_user, self.smtp_password)
-                server.sendmail(self.smtp_from, emails, msg.as_string())
-
-            logger.info(f"Sent notification to {len(emails)} recipient(s)")
-
-        except Exception as e:
-            logger.error(f"Failed to send notification: {e}")
 
     def is_device_healthy(self, device: str) -> bool:
         """Check if a device is healthy (good or unknown state)."""
@@ -976,30 +877,6 @@ def main() -> None:
         help="JSON file to persist device health state",
     )
 
-    # SMTP for notifications
-    parser.add_argument(
-        "--smtp-host",
-        help="SMTP server for notifications (or SMTP_HOST env)",
-    )
-    parser.add_argument(
-        "--smtp-port",
-        type=int,
-        default=587,
-        help="SMTP port (default: 587)",
-    )
-    parser.add_argument(
-        "--smtp-user",
-        help="SMTP username (or SMTP_USER env)",
-    )
-    parser.add_argument(
-        "--smtp-password",
-        help="SMTP password (or SMTP_PASSWORD env)",
-    )
-    parser.add_argument(
-        "--smtp-from",
-        help="From address for emails (or SMTP_FROM env)",
-    )
-
     # Debug
     parser.add_argument(
         "--debug", "-d",
@@ -1027,11 +904,6 @@ def main() -> None:
         artifact_dir=args.artifact_dir,
         health_checks_dir=args.health_checks_dir,
         health_state_file=args.health_state_file,
-        smtp_host=args.smtp_host,
-        smtp_port=args.smtp_port,
-        smtp_user=args.smtp_user,
-        smtp_password=args.smtp_password,
-        smtp_from=args.smtp_from,
     )
 
     # Signal handling

@@ -28,16 +28,3 @@ test_path: tests/health/test_boot.py
 
 # Test timeout in seconds
 timeout: 600
-
-# Notification settings
-notifications:
-  # Email addresses to notify on failure/recovery
-  emails:
-    - lab-admin@example.com
-    - device-owner@example.com
-
-  # Send notification when health check fails (default: true)
-  on_failure: true
-
-  # Send notification when device recovers (passes after previous failure)
-  on_recovery: true
