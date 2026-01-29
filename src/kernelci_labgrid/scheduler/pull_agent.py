@@ -1,10 +1,12 @@
-"""Pull Mode Agent for KernelCI Labgrid Integration.
+"""KernelCI Labgrid Agent.
 
-This agent runs locally in Labgrid labs and:
+A single daemon that:
 1. Polls KernelCI API for pending test jobs
-2. Downloads kernel/rootfs artifacts
-3. Runs pytest with labgrid (your existing tests)
-4. Reports results back to KernelCI API
+2. Runs periodic health checks on devices (like LAVA)
+3. Downloads kernel/rootfs artifacts
+4. Runs pytest with labgrid (your existing tests)
+5. Reports results back to KernelCI API
+6. Sends email notifications when devices fail health checks
 
 No modifications needed to KernelCI infrastructure.
 """
@@ -12,19 +14,28 @@ No modifications needed to KernelCI infrastructure.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
 import signal
+import smtplib
 import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any
 
 import aiohttp
+import yaml
 
 logger = logging.getLogger(__name__)
+
+
+# ==================== Data Classes ====================
 
 
 @dataclass
@@ -55,25 +66,84 @@ class TestResult:
         return "pass"
 
 
-class LabgridPullAgent:
-    """Pull mode agent - runs pytest locally, reports to KernelCI.
+@dataclass
+class DeviceHealth:
+    """Health state of a device."""
+
+    device: str
+    state: str = "unknown"  # good, bad, unknown
+    last_check: datetime | None = None
+    last_success: datetime | None = None
+    failure_count: int = 0
+    failure_reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "device": self.device,
+            "state": self.state,
+            "last_check": self.last_check.isoformat() if self.last_check else None,
+            "last_success": self.last_success.isoformat() if self.last_success else None,
+            "failure_count": self.failure_count,
+            "failure_reason": self.failure_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DeviceHealth":
+        return cls(
+            device=data["device"],
+            state=data.get("state", "unknown"),
+            last_check=datetime.fromisoformat(data["last_check"]) if data.get("last_check") else None,
+            last_success=datetime.fromisoformat(data["last_success"]) if data.get("last_success") else None,
+            failure_count=data.get("failure_count", 0),
+            failure_reason=data.get("failure_reason", ""),
+        )
+
+
+@dataclass
+class HealthCheckConfig:
+    """Configuration for a device health check."""
+
+    device: str
+    target: str  # labgrid target YAML filename
+    frequency_hours: int = 24
+    golden_image: dict[str, str] = field(default_factory=dict)
+    test_path: str = ""  # specific test file, empty = all tests
+    timeout: int = 3600
+    notifications: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> "HealthCheckConfig":
+        """Load config from YAML file."""
+        with open(path) as f:
+            data = yaml.safe_load(f)
+
+        return cls(
+            device=data["device"],
+            target=data.get("target", f"{data['device']}.yaml"),
+            frequency_hours=data.get("frequency_hours", 24),
+            golden_image=data.get("golden_image", {}),
+            test_path=data.get("test_path", ""),
+            timeout=data.get("timeout", 3600),
+            notifications=data.get("notifications", {}),
+        )
+
+
+# ==================== Main Agent ====================
+
+
+class LabgridAgent:
+    """Unified agent for KernelCI job execution and device health checks.
 
     Example:
-        agent = LabgridPullAgent(
+        agent = LabgridAgent(
             api_url="https://api.kernelci.org",
             api_token="your-token",
             lab_name="my-lab",
-            tests_dir="/path/to/openwrt-tests",
+            tests_dir="/path/to/openwrt-tests/tests",
             targets_dir="/path/to/openwrt-tests/targets",
+            health_checks_dir="/etc/labgrid/health_checks",  # optional
         )
         await agent.run()
-
-    With health checks:
-        from kernelci_labgrid.scheduler.health_check import HealthCheckScheduler
-
-        health_scheduler = HealthCheckScheduler(...)
-        agent = LabgridPullAgent(..., health_scheduler=health_scheduler)
-        await agent.run()  # Will skip jobs for unhealthy devices
     """
 
     def __init__(
@@ -87,9 +157,17 @@ class LabgridPullAgent:
         poll_interval: int = 30,
         artifact_dir: str | Path | None = None,
         default_timeout: int = 3600,
-        health_scheduler: Any | None = None,
+        # Health check options
+        health_checks_dir: str | Path | None = None,
+        health_state_file: str | Path | None = None,
+        # SMTP options for notifications
+        smtp_host: str | None = None,
+        smtp_port: int = 587,
+        smtp_user: str | None = None,
+        smtp_password: str | None = None,
+        smtp_from: str | None = None,
     ):
-        """Initialize the pull agent.
+        """Initialize the agent.
 
         Args:
             api_url: KernelCI API URL
@@ -100,7 +178,13 @@ class LabgridPullAgent:
             poll_interval: Seconds between API polls
             artifact_dir: Directory for downloaded artifacts
             default_timeout: Default test timeout in seconds
-            health_scheduler: Optional HealthCheckScheduler for device health tracking
+            health_checks_dir: Directory with health check YAML configs (optional)
+            health_state_file: JSON file to persist device health state
+            smtp_host: SMTP server for notifications
+            smtp_port: SMTP port
+            smtp_user: SMTP username
+            smtp_password: SMTP password
+            smtp_from: From address for emails
         """
         self.api_url = api_url.rstrip("/")
         self.api_token = api_token
@@ -110,13 +194,26 @@ class LabgridPullAgent:
         self.poll_interval = poll_interval
         self.artifact_dir = Path(artifact_dir or tempfile.mkdtemp(prefix="kci-labgrid-"))
         self.default_timeout = default_timeout
-        self.health_scheduler = health_scheduler
 
+        # Health check configuration
+        self.health_checks_dir = Path(health_checks_dir) if health_checks_dir else None
+        self.health_state_file = Path(health_state_file) if health_state_file else None
+
+        # SMTP configuration
+        self.smtp_host = smtp_host or os.environ.get("SMTP_HOST")
+        self.smtp_port = smtp_port
+        self.smtp_user = smtp_user or os.environ.get("SMTP_USER")
+        self.smtp_password = smtp_password or os.environ.get("SMTP_PASSWORD")
+        self.smtp_from = smtp_from or os.environ.get("SMTP_FROM", "labgrid@localhost")
+
+        # Runtime state
         self._session: aiohttp.ClientSession | None = None
         self._running = False
         self._current_jobs: set[str] = set()
+        self._health_configs: dict[str, HealthCheckConfig] = {}
+        self._device_health: dict[str, DeviceHealth] = {}
 
-    async def __aenter__(self) -> "LabgridPullAgent":
+    async def __aenter__(self) -> "LabgridAgent":
         await self.start()
         return self
 
@@ -125,11 +222,17 @@ class LabgridPullAgent:
 
     async def start(self) -> None:
         """Start the agent."""
-        logger.info(f"Starting pull agent for lab: {self.lab_name}")
+        logger.info(f"Starting agent for lab: {self.lab_name}")
         logger.info(f"Tests directory: {self.tests_dir}")
         logger.info(f"Targets directory: {self.targets_dir}")
 
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        # Load health check configs if directory provided
+        if self.health_checks_dir:
+            self._load_health_configs()
+            self._load_health_state()
+            logger.info(f"Health checks enabled: {len(self._health_configs)} device(s)")
 
         self._session = aiohttp.ClientSession(
             headers={
@@ -139,12 +242,15 @@ class LabgridPullAgent:
         )
 
         self._running = True
-        logger.info("Pull agent started")
+        logger.info("Agent started")
 
     async def stop(self) -> None:
         """Stop the agent."""
-        logger.info("Stopping pull agent")
+        logger.info("Stopping agent")
         self._running = False
+
+        # Save health state
+        self._save_health_state()
 
         # Wait for current jobs
         if self._current_jobs:
@@ -158,10 +264,10 @@ class LabgridPullAgent:
             await self._session.close()
             self._session = None
 
-        logger.info("Pull agent stopped")
+        logger.info("Agent stopped")
 
     async def run(self) -> None:
-        """Main loop - poll and execute jobs."""
+        """Main loop - poll for jobs and run health checks."""
         if not self._running:
             await self.start()
 
@@ -169,11 +275,245 @@ class LabgridPullAgent:
 
         while self._running:
             try:
+                # Run health checks if due
+                await self._check_health()
+
+                # Poll and execute KernelCI jobs
                 await self._poll_and_execute()
+
             except Exception as e:
-                logger.exception(f"Poll error: {e}")
+                logger.exception(f"Loop error: {e}")
 
             await asyncio.sleep(self.poll_interval)
+
+    # ==================== Health Check Methods ====================
+
+    def _load_health_configs(self) -> None:
+        """Load health check configurations from directory."""
+        self._health_configs.clear()
+
+        if not self.health_checks_dir or not self.health_checks_dir.exists():
+            return
+
+        for yaml_file in self.health_checks_dir.glob("*.yaml"):
+            try:
+                config = HealthCheckConfig.from_yaml(yaml_file)
+                self._health_configs[config.device] = config
+                logger.info(f"Loaded health check: {config.device} (every {config.frequency_hours}h)")
+            except Exception as e:
+                logger.error(f"Failed to load {yaml_file}: {e}")
+
+    def _load_health_state(self) -> None:
+        """Load persisted health state."""
+        if not self.health_state_file or not self.health_state_file.exists():
+            return
+
+        try:
+            with open(self.health_state_file) as f:
+                data = json.load(f)
+
+            for device_data in data.get("devices", []):
+                health = DeviceHealth.from_dict(device_data)
+                self._device_health[health.device] = health
+
+            logger.info(f"Loaded health state for {len(self._device_health)} device(s)")
+        except Exception as e:
+            logger.error(f"Failed to load health state: {e}")
+
+    def _save_health_state(self) -> None:
+        """Persist health state to file."""
+        if not self.health_state_file:
+            return
+
+        try:
+            self.health_state_file.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "updated": datetime.now().isoformat(),
+                "devices": [h.to_dict() for h in self._device_health.values()],
+            }
+            with open(self.health_state_file, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save health state: {e}")
+
+    async def _check_health(self) -> None:
+        """Check which devices need health checks and run them."""
+        if not self._health_configs:
+            return
+
+        now = datetime.now()
+
+        for device, config in self._health_configs.items():
+            health = self._device_health.get(device, DeviceHealth(device=device))
+
+            # Check if health check is due
+            if health.last_check:
+                next_check = health.last_check + timedelta(hours=config.frequency_hours)
+                if now < next_check:
+                    continue
+
+            logger.info(f"Running health check for {device}")
+            await self._run_health_check(device, config)
+
+    async def _run_health_check(self, device: str, config: HealthCheckConfig) -> None:
+        """Run a health check for a device."""
+        health = self._device_health.get(device, DeviceHealth(device=device))
+        previous_state = health.state
+
+        try:
+            # Download golden image artifacts
+            artifacts = await self._download_health_artifacts(device, config)
+
+            # Find target YAML
+            target_yaml = self.targets_dir / config.target
+            if not target_yaml.exists():
+                raise RuntimeError(f"Target not found: {target_yaml}")
+
+            # Run pytest
+            result = await self._run_pytest(
+                target_yaml=target_yaml,
+                artifacts=artifacts,
+                job_data={"test_path": config.test_path, "timeout": config.timeout},
+            )
+
+            # Update health state
+            health.last_check = datetime.now()
+
+            if result.success:
+                health.state = "good"
+                health.last_success = datetime.now()
+                health.failure_count = 0
+                health.failure_reason = ""
+
+                logger.info(f"Health check PASSED for {device}")
+
+                # Notify on recovery
+                if previous_state == "bad" and config.notifications.get("on_recovery"):
+                    await self._send_notification(
+                        config, device, recovered=True,
+                        message=f"Device {device} has recovered and passed health check"
+                    )
+            else:
+                health.state = "bad"
+                health.failure_count += 1
+                health.failure_reason = result.output[:500] if result.output else "Test failed"
+
+                logger.warning(f"Health check FAILED for {device}")
+
+                # Notify on failure
+                if config.notifications.get("on_failure", True):
+                    await self._send_notification(
+                        config, device, recovered=False,
+                        message=f"Device {device} failed health check",
+                        details=result.output,
+                    )
+
+        except Exception as e:
+            health.last_check = datetime.now()
+            health.state = "bad"
+            health.failure_count += 1
+            health.failure_reason = str(e)
+
+            logger.exception(f"Health check error for {device}")
+
+            if config.notifications.get("on_failure", True):
+                await self._send_notification(
+                    config, device, recovered=False,
+                    message=f"Device {device} health check error: {e}",
+                )
+
+        self._device_health[device] = health
+        self._save_health_state()
+
+    async def _download_health_artifacts(
+        self, device: str, config: HealthCheckConfig
+    ) -> dict[str, Path]:
+        """Download golden image artifacts for health check."""
+        artifacts: dict[str, Path] = {}
+        device_dir = self.artifact_dir / f"health-{device}"
+        device_dir.mkdir(exist_ok=True)
+
+        if not self._session or not config.golden_image:
+            return artifacts
+
+        for name, url in config.golden_image.items():
+            if not url:
+                continue
+
+            local_path = device_dir / name
+            logger.debug(f"Downloading golden {name} for {device}...")
+
+            try:
+                async with self._session.get(url) as resp:
+                    if resp.status == 200:
+                        content = await resp.read()
+                        local_path.write_bytes(content)
+                        artifacts[name] = local_path
+            except Exception as e:
+                logger.error(f"Failed to download {name}: {e}")
+
+        return artifacts
+
+    async def _send_notification(
+        self,
+        config: HealthCheckConfig,
+        device: str,
+        recovered: bool,
+        message: str,
+        details: str = "",
+    ) -> None:
+        """Send email notification."""
+        emails = config.notifications.get("emails", [])
+        if not emails:
+            return
+
+        if not self.smtp_host:
+            logger.warning("SMTP not configured, skipping notification")
+            return
+
+        subject = f"[Labgrid] Device {device} {'RECOVERED' if recovered else 'FAILED'}"
+
+        body = f"""Health Check Notification
+========================
+
+Device: {device}
+Status: {'RECOVERED' if recovered else 'FAILED'}
+Time: {datetime.now().isoformat()}
+
+{message}
+"""
+
+        if details:
+            body += f"\nDetails:\n--------\n{details[:2000]}\n"
+
+        try:
+            msg = MIMEMultipart()
+            msg["From"] = self.smtp_from
+            msg["To"] = ", ".join(emails)
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain"))
+
+            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+                if self.smtp_user and self.smtp_password:
+                    server.starttls()
+                    server.login(self.smtp_user, self.smtp_password)
+                server.sendmail(self.smtp_from, emails, msg.as_string())
+
+            logger.info(f"Sent notification to {len(emails)} recipient(s)")
+
+        except Exception as e:
+            logger.error(f"Failed to send notification: {e}")
+
+    def is_device_healthy(self, device: str) -> bool:
+        """Check if a device is healthy (good or unknown state)."""
+        health = self._device_health.get(device)
+        if not health:
+            return True  # Unknown devices are assumed healthy
+        return health.state != "bad"
+
+    def get_device_health(self, device: str) -> DeviceHealth | None:
+        """Get health state for a device."""
+        return self._device_health.get(device)
 
     # ==================== API Methods ====================
 
@@ -264,9 +604,9 @@ class LabgridPullAgent:
             if not target_yaml:
                 raise RuntimeError(f"No target YAML found for platform: {platform}")
 
-            # 2. Check device health (if health scheduler is configured)
-            if self.health_scheduler and not self.health_scheduler.is_device_healthy(platform):
-                health = self.health_scheduler.get_device_health(platform)
+            # 2. Check device health
+            if not self.is_device_healthy(platform):
+                health = self.get_device_health(platform)
                 reason = health.failure_reason if health else "Unknown"
                 raise RuntimeError(f"Device {platform} is unhealthy: {reason}")
 
@@ -303,7 +643,7 @@ class LabgridPullAgent:
     ) -> dict[str, Path]:
         """Download job artifacts."""
         artifacts = job_data.get("artifacts", {})
-        local = {}
+        local: dict[str, Path] = {}
 
         job_dir = self.artifact_dir / node_id
         job_dir.mkdir(exist_ok=True)
@@ -346,7 +686,6 @@ class LabgridPullAgent:
         candidates = [
             self.targets_dir / f"{platform}.yaml",
             self.targets_dir / f"{platform}.yml",
-            # Common variations
             self.targets_dir / f"qemu-{platform}.yaml",
             self.targets_dir / f"{platform.replace('-', '_')}.yaml",
         ]
@@ -370,7 +709,7 @@ class LabgridPullAgent:
     ) -> TestResult:
         """Run pytest with labgrid environment, output JUnit XML."""
         timeout = job_data.get("timeout", self.default_timeout)
-        test_path = job_data.get("test_path", "")  # specific test file/dir
+        test_path = job_data.get("test_path", "")
 
         # Create temp file for JUnit XML output
         junit_xml = self.artifact_dir / f"junit-{os.getpid()}.xml"
@@ -381,7 +720,7 @@ class LabgridPullAgent:
             "--lg-env", str(target_yaml),
             "--tb=short",
             "-v",
-            f"--junit-xml={junit_xml}",  # JUnit XML output
+            f"--junit-xml={junit_xml}",
         ]
 
         # Add artifact paths as environment variables
@@ -419,10 +758,7 @@ class LabgridPullAgent:
                 output = stdout.decode() if stdout else ""
             except asyncio.TimeoutError:
                 proc.kill()
-                return TestResult(
-                    errors=1,
-                    output="Test timed out",
-                )
+                return TestResult(errors=1, output="Test timed out")
 
         except Exception as e:
             return TestResult(errors=1, output=str(e))
@@ -438,21 +774,7 @@ class LabgridPullAgent:
         return result
 
     def _parse_junit_xml(self, junit_xml: Path) -> TestResult:
-        """Parse JUnit XML output from pytest.
-
-        JUnit XML format:
-        <testsuites>
-          <testsuite name="pytest" tests="5" errors="0" failures="1" skipped="1" time="10.5">
-            <testcase classname="test_boot" name="test_login" time="1.2"/>
-            <testcase classname="test_boot" name="test_network" time="2.3">
-              <failure message="AssertionError">...</failure>
-            </testcase>
-            <testcase classname="test_boot" name="test_skip" time="0.1">
-              <skipped message="reason"/>
-            </testcase>
-          </testsuite>
-        </testsuites>
-        """
+        """Parse JUnit XML output from pytest."""
         result = TestResult()
 
         if not junit_xml.exists():
@@ -470,20 +792,17 @@ class LabgridPullAgent:
                 testsuites = [root]
 
             for testsuite in testsuites:
-                # Get summary from testsuite attributes
                 result.total += int(testsuite.get("tests", 0))
                 result.errors += int(testsuite.get("errors", 0))
                 result.failed += int(testsuite.get("failures", 0))
                 result.skipped += int(testsuite.get("skipped", 0))
                 result.duration += float(testsuite.get("time", 0))
 
-                # Parse individual test cases
                 for testcase in testsuite.findall("testcase"):
                     name = testcase.get("name", "unknown")
                     classname = testcase.get("classname", "")
                     duration = float(testcase.get("time", 0))
 
-                    # Determine result from child elements
                     if testcase.find("failure") is not None:
                         tc_result = "fail"
                         failure = testcase.find("failure")
@@ -508,7 +827,6 @@ class LabgridPullAgent:
                         "message": message,
                     })
 
-            # Calculate passed from total - (failed + errors + skipped)
             result.passed = result.total - result.failed - result.errors - result.skipped
 
         except ET.ParseError as e:
@@ -521,17 +839,11 @@ class LabgridPullAgent:
 
     async def _report_results(self, node_id: str, result: TestResult) -> None:
         """Report test results to KernelCI API."""
-        # Create test case nodes from JUnit XML data
         for tc in result.test_cases:
-            tc_data: dict[str, Any] = {
-                "duration": tc.get("duration", 0),
-            }
+            tc_data: dict[str, Any] = {"duration": tc.get("duration", 0)}
 
-            # Include failure/error message if present
             if tc.get("message"):
                 tc_data["error_msg"] = tc["message"]
-
-            # Include classname for grouping
             if tc.get("classname"):
                 tc_data["classname"] = tc["classname"]
 
@@ -550,7 +862,6 @@ class LabgridPullAgent:
             except Exception as e:
                 logger.warning(f"Failed to create test case node: {e}")
 
-        # Update job node with summary
         await self._api_put(
             f"/api/latest/nodes/{node_id}",
             {
@@ -585,12 +896,10 @@ class LabgridPullAgent:
     def _map_outcome(outcome: str) -> str:
         """Map pytest/JUnit outcome to KernelCI result."""
         mapping = {
-            # JUnit XML outcomes
             "pass": "pass",
             "fail": "fail",
             "skip": "skip",
             "error": "incomplete",
-            # pytest outcomes
             "passed": "pass",
             "failed": "fail",
             "skipped": "skip",
@@ -600,25 +909,22 @@ class LabgridPullAgent:
         return mapping.get(outcome.lower(), "skip")
 
 
+# Keep old name for backwards compatibility
+LabgridPullAgent = LabgridAgent
+
+
 # ==================== CLI ====================
+
 
 def main() -> None:
     """CLI entry point."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="KernelCI Labgrid Pull Agent - runs pytest locally"
+        description="KernelCI Labgrid Agent - polls for jobs & runs health checks"
     )
-    parser.add_argument(
-        "--api-url",
-        default=os.environ.get("KCI_API_URL", "https://api.kernelci.org"),
-        help="KernelCI API URL",
-    )
-    parser.add_argument(
-        "--api-token",
-        default=os.environ.get("KCI_API_TOKEN"),
-        help="KernelCI API token (or KCI_API_TOKEN env)",
-    )
+
+    # Required arguments
     parser.add_argument(
         "--lab-name", "-l",
         required=True,
@@ -629,20 +935,72 @@ def main() -> None:
         required=True,
         help="Path to tests directory (e.g., openwrt-tests/tests)",
     )
+
+    # KernelCI API
+    parser.add_argument(
+        "--api-url",
+        default=os.environ.get("KCI_API_URL", "https://api.kernelci.org"),
+        help="KernelCI API URL",
+    )
+    parser.add_argument(
+        "--api-token",
+        default=os.environ.get("KCI_API_TOKEN"),
+        help="KernelCI API token (or KCI_API_TOKEN env)",
+    )
+
+    # Directories
     parser.add_argument(
         "--targets-dir",
         help="Path to labgrid targets (default: tests_dir/../targets)",
     )
     parser.add_argument(
-        "--poll-interval", "-p",
-        type=int,
-        default=30,
-        help="Poll interval in seconds",
-    )
-    parser.add_argument(
         "--artifact-dir", "-a",
         help="Directory for artifacts",
     )
+
+    # Polling
+    parser.add_argument(
+        "--poll-interval", "-p",
+        type=int,
+        default=30,
+        help="Poll interval in seconds (default: 30)",
+    )
+
+    # Health checks
+    parser.add_argument(
+        "--health-checks-dir", "-c",
+        help="Directory with health check YAML configs (enables health checks)",
+    )
+    parser.add_argument(
+        "--health-state-file", "-s",
+        help="JSON file to persist device health state",
+    )
+
+    # SMTP for notifications
+    parser.add_argument(
+        "--smtp-host",
+        help="SMTP server for notifications (or SMTP_HOST env)",
+    )
+    parser.add_argument(
+        "--smtp-port",
+        type=int,
+        default=587,
+        help="SMTP port (default: 587)",
+    )
+    parser.add_argument(
+        "--smtp-user",
+        help="SMTP username (or SMTP_USER env)",
+    )
+    parser.add_argument(
+        "--smtp-password",
+        help="SMTP password (or SMTP_PASSWORD env)",
+    )
+    parser.add_argument(
+        "--smtp-from",
+        help="From address for emails (or SMTP_FROM env)",
+    )
+
+    # Debug
     parser.add_argument(
         "--debug", "-d",
         action="store_true",
@@ -659,7 +1017,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    agent = LabgridPullAgent(
+    agent = LabgridAgent(
         api_url=args.api_url,
         api_token=args.api_token,
         lab_name=args.lab_name,
@@ -667,6 +1025,13 @@ def main() -> None:
         targets_dir=args.targets_dir,
         poll_interval=args.poll_interval,
         artifact_dir=args.artifact_dir,
+        health_checks_dir=args.health_checks_dir,
+        health_state_file=args.health_state_file,
+        smtp_host=args.smtp_host,
+        smtp_port=args.smtp_port,
+        smtp_user=args.smtp_user,
+        smtp_password=args.smtp_password,
+        smtp_from=args.smtp_from,
     )
 
     # Signal handling

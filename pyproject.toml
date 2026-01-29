@@ -42,8 +42,8 @@ dev = [
 ]
 
 [project.scripts]
-labgrid-pull-agent = "kernelci_labgrid.scheduler.pull_agent:main"
-labgrid-health-check = "kernelci_labgrid.scheduler.health_check:main"
+labgrid-agent = "kernelci_labgrid.scheduler.pull_agent:main"
+labgrid-pull-agent = "kernelci_labgrid.scheduler.pull_agent:main"  # backwards compat
 
 [project.urls]
 Homepage = "https://github.com/kernelci/kernelci-labgrid"
