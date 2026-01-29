@@ -1,208 +1,203 @@
-# KernelCI Labgrid Scheduler
+# KernelCI Labgrid Pull Agent
 
-Labgrid runtime scheduler for KernelCI's Maestro pipeline. This project enables integration between [KernelCI](https://kernelci.org/) and [Labgrid](https://labgrid.readthedocs.io/) test labs for automated Linux kernel testing.
+A simple agent that connects your Labgrid test lab to KernelCI. Runs locally in your lab, polls KernelCI for jobs, executes your existing pytest tests, and reports results back.
 
-## Overview
-
-This scheduler provides two operation modes:
-
-- **Push Mode**: For Labgrid coordinators accessible from KernelCI infrastructure
-- **Pull Mode**: For labs behind firewalls that poll for pending jobs
+**No modifications needed to KernelCI infrastructure.**
 
 ## Architecture
 
 ```
-                          KernelCI Infrastructure
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────┐    ┌──────────────┐    ┌───────────────┐  │
-│  │ KernelCI    │    │ Maestro      │    │ labgrid-      │  │
-│  │ API         │◄──►│ Scheduler    │◄──►│ scheduler     │  │
-│  │ (Pub/Sub)   │    │ Service      │    │ (this)        │  │
-│  └─────────────┘    └──────────────┘    └───────┬───────┘  │
-│                                                  │          │
-└──────────────────────────────────────────────────┼──────────┘
-                                                   │
-                    ┌──────────────────────────────┼──────────┐
-                    │          gRPC                │          │
-                    ▼                              ▼          │
-              ┌───────────┐                  ┌──────────┐     │
-              │ Labgrid   │                  │ Result   │     │
-              │Coordinator│                  │ Reporter │     │
-              └─────┬─────┘                  └──────────┘     │
-                    │                                         │
-              ┌─────┴─────┐                                   │
-              │           │            Labgrid Lab            │
-         ┌────┴───┐  ┌────┴───┐                              │
-         │Exporter│  │Exporter│                              │
-         │(Board1)│  │(Board2)│                              │
-         └────────┘  └────────┘                              │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                   KERNELCI CLOUD (unchanged)                    │
+│                                                                 │
+│   ┌──────────────┐       ┌──────────────┐                      │
+│   │ KernelCI API │       │   Maestro    │                      │
+│   │              │       │   Pipeline   │                      │
+│   └──────────────┘       └──────────────┘                      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              ▲
+                              │ HTTPS (poll jobs, report results)
+                              │
+┌─────────────────────────────┼───────────────────────────────────┐
+│               YOUR LAB      │                                   │
+│                             │                                   │
+│   ┌─────────────────────────┴─────────────────────────────┐    │
+│   │              labgrid-pull-agent                       │    │
+│   │                                                       │    │
+│   │  1. Poll KernelCI API for pending jobs               │    │
+│   │  2. Download artifacts (kernel, rootfs)              │    │
+│   │  3. pytest --lg-env targets/xxx.yaml tests/          │    │
+│   │  4. Report results back to API                       │    │
+│   └───────────────────────────┬───────────────────────────┘    │
+│                               │                                 │
+│                               │ runs your tests                 │
+│                               ▼                                 │
+│   ┌───────────────────────────────────────────────────────┐    │
+│   │              openwrt-tests (your repo)                │    │
+│   │                                                       │    │
+│   │  tests/test_*.py      <- pytest tests                │    │
+│   │  targets/*.yaml       <- labgrid environments        │    │
+│   │  conftest.py          <- fixtures                    │    │
+│   └───────────────────────────┬───────────────────────────┘    │
+│                               │                                 │
+│                               │ pytest-labgrid                  │
+│                               ▼                                 │
+│                    ┌─────────────────────┐                     │
+│                    │  labgrid-exporter   │                     │
+│                    │  + your boards      │                     │
+│                    └─────────────────────┘                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Requirements
 
 - Python 3.10+
-- Labgrid 25.0+ (gRPC-based coordinator)
-- Access to KernelCI API
-- Network access to Labgrid coordinator (push mode) or KernelCI API (pull mode)
+- Your existing test repository (e.g., openwrt-tests) with:
+  - pytest tests in `tests/`
+  - labgrid target YAMLs in `targets/`
+- labgrid + pytest-labgrid installed
+- KernelCI API token
 
 ## Installation
 
 ```bash
-# From PyPI (when published)
 pip install kernelci-labgrid
+```
 
-# From source
+Or from source:
+
+```bash
 git clone https://github.com/kernelci/kernelci-labgrid.git
 cd kernelci-labgrid
-pip install -e ".[dev]"
-```
-
-## Configuration
-
-### Runtime Configuration
-
-Create a runtime configuration file (see `config/labgrid-runtime.yaml`):
-
-```yaml
-runtimes:
-  labgrid-mylab:
-    lab_type: labgrid
-    coordinator_address: "labgrid.example.com:20408"
-    mode: push
-    place_mapping:
-      - place: rpi4-slot1
-        platform: bcm2711-rpi-4-b
-        compatible:
-          - "brcm,bcm2711"
-```
-
-### Scheduler Configuration
-
-Define which jobs trigger Labgrid tests (see `config/labgrid-scheduler.yaml`):
-
-```yaml
-scheduler:
-  - job: baseline-arm64
-    event:
-      channel: node
-      name: kbuild-gcc-12-arm64
-      result: pass
-    runtime:
-      type: labgrid
-      name: labgrid-mylab
-    platforms:
-      - bcm2711-rpi-4-b
+pip install -e .
 ```
 
 ## Usage
 
-### Push Mode Scheduler
-
-For labs with accessible Labgrid coordinators:
-
 ```bash
-export KCI_API_URL=https://api.kernelci.org
-export KCI_API_TOKEN=your-token
-export LABGRID_COORDINATOR=labgrid.example.com:20408
+# Set your API token
+export KCI_API_TOKEN="your-kernelci-api-token"
 
-labgrid-scheduler --config config/labgrid-runtime.yaml
+# Run the agent
+labgrid-pull-agent \
+    --lab-name my-lab \
+    --tests-dir /path/to/openwrt-tests/tests \
+    --targets-dir /path/to/openwrt-tests/targets
 ```
 
-### Pull Mode Agent
+### Options
 
-For labs behind firewalls:
+| Option | Description |
+|--------|-------------|
+| `--lab-name`, `-l` | Your lab name (jobs are filtered by this) |
+| `--tests-dir`, `-t` | Path to your pytest tests directory |
+| `--targets-dir` | Path to labgrid target YAMLs (default: tests/../targets) |
+| `--api-url` | KernelCI API URL (default: https://api.kernelci.org) |
+| `--api-token` | API token (or set `KCI_API_TOKEN` env) |
+| `--poll-interval`, `-p` | Seconds between polls (default: 30) |
+| `--artifact-dir`, `-a` | Where to download artifacts |
+| `--debug`, `-d` | Enable debug logging |
+
+### Environment Variables
 
 ```bash
-export KCI_API_URL=https://api.kernelci.org
-export KCI_API_TOKEN=your-token
-export LABGRID_COORDINATOR=localhost:20408
-
-labgrid-pull-agent --lab-name mylab --poll-interval 30
+KCI_API_URL=https://api.kernelci.org
+KCI_API_TOKEN=your-token
+LG_KERNEL=/path/to/kernel      # Set by agent, available in tests
+LG_ROOTFS=/path/to/rootfs      # Set by agent, available in tests
+LG_DTB=/path/to/dtb            # Set by agent, available in tests
 ```
 
-### Docker Deployment
+## How It Works
+
+1. **Agent polls** KernelCI API for pending jobs matching your lab name
+2. **Claims job** by setting state to "running"
+3. **Downloads artifacts** (kernel, rootfs, etc.) to local directory
+4. **Runs pytest** with your tests and labgrid environment:
+   ```bash
+   pytest --lg-env targets/platform.yaml tests/
+   ```
+5. **Parses results** from pytest output
+6. **Reports back** to KernelCI API (pass/fail, test cases, duration)
+
+## Job Format
+
+Jobs in KernelCI API should have this structure:
+
+```json
+{
+  "id": "node-id-123",
+  "name": "boot-test",
+  "state": "pending",
+  "data": {
+    "lab": "my-lab",
+    "platform": "qemu-x86-64",
+    "artifacts": {
+      "kernel": "https://storage.kernelci.org/.../bzImage",
+      "rootfs": "https://storage.kernelci.org/.../rootfs.cpio.gz"
+    },
+    "test_path": "test_boot.py",
+    "timeout": 600
+  }
+}
+```
+
+## Example with openwrt-tests
 
 ```bash
-cd docker
-docker-compose up -d
+# Clone your test repo
+git clone https://github.com/aparcar/openwrt-tests.git
+cd openwrt-tests
+
+# Install dependencies
+pip install pytest pytest-labgrid labgrid kernelci-labgrid
+
+# Run the agent
+labgrid-pull-agent \
+    --lab-name openwrt-lab \
+    --tests-dir ./tests \
+    --targets-dir ./targets \
+    --debug
+```
+
+## Systemd Service
+
+```ini
+# /etc/systemd/system/labgrid-agent.service
+[Unit]
+Description=KernelCI Labgrid Pull Agent
+After=network-online.target
+
+[Service]
+Type=simple
+User=labgrid
+Environment="KCI_API_TOKEN=your-token"
+ExecStart=/usr/local/bin/labgrid-pull-agent \
+    --lab-name my-lab \
+    --tests-dir /opt/openwrt-tests/tests
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ## Development
 
-### Setup
-
 ```bash
-# Clone the repository
-git clone https://github.com/kernelci/kernelci-labgrid.git
-cd kernelci-labgrid
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install with development dependencies
+# Install dev dependencies
 pip install -e ".[dev]"
 
-# Generate gRPC stubs (if proto files change)
-python -m grpc_tools.protoc \
-    -I./proto \
-    --python_out=./src/kernelci_labgrid/generated \
-    --grpc_python_out=./src/kernelci_labgrid/generated \
-    ./proto/labgrid_coordinator.proto
-```
-
-### Running Tests
-
-```bash
-# Run all tests
+# Run tests
 pytest
 
-# Run with coverage
-pytest --cov=kernelci_labgrid --cov-report=html
-
-# Run specific test file
-pytest tests/unit/test_runtime.py
-```
-
-### Code Quality
-
-```bash
 # Format code
 black src/ tests/
 ruff check --fix src/ tests/
-
-# Type checking
-mypy src/
-```
-
-## Integration with kernelci-pipeline
-
-To integrate with an existing KernelCI pipeline deployment, add the Labgrid runtime to your `pipeline.yaml`:
-
-```yaml
-runtimes:
-  labgrid-mylab:
-    lab_type: labgrid
-    coordinator_address: "coordinator.example.com:20408"
-    mode: push
-    place_mapping:
-      - place: board-1
-        platform: bcm2711-rpi-4-b
 ```
 
 ## License
 
 LGPL-2.1-or-later
-
-## Contributing
-
-Contributions are welcome! Please read the [KernelCI contribution guidelines](https://kernelci.org/docs/contribute/) before submitting pull requests.
-
-## Resources
-
-- [KernelCI Documentation](https://docs.kernelci.org/)
-- [Labgrid Documentation](https://labgrid.readthedocs.io/)
-- [KernelCI API](https://github.com/kernelci/kernelci-api)
-- [KernelCI Pipeline](https://github.com/kernelci/kernelci-pipeline)

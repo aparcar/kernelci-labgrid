@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "kernelci-labgrid"
 version = "0.1.0"
-description = "Labgrid runtime scheduler for KernelCI Maestro pipeline"
+description = "Pull agent to connect Labgrid test labs to KernelCI"
 readme = "README.md"
 license = "LGPL-2.1-or-later"
 requires-python = ">=3.10"
@@ -27,14 +27,6 @@ keywords = ["kernelci", "labgrid", "testing", "embedded", "linux"]
 
 dependencies = [
     "aiohttp>=3.9.0",
-    "grpcio>=1.60.0",
-    "grpcio-tools>=1.60.0",
-    "protobuf>=4.25.0",
-    "pyyaml>=6.0",
-    "jinja2>=3.1.0",
-    "asyncio-mqtt>=0.16.0",
-    "paramiko>=3.4.0",
-    "click>=8.1.0",
 ]
 
 [project.optional-dependencies]
@@ -42,16 +34,14 @@ dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.1.0",
+    "pytest-json-report>=1.5.0",
     "mypy>=1.8.0",
     "ruff>=0.1.0",
     "black>=24.0.0",
-    "grpcio-testing>=1.60.0",
 ]
 
 [project.scripts]
-kernelci-labgrid = "kernelci_labgrid.cli:main"
 labgrid-pull-agent = "kernelci_labgrid.scheduler.pull_agent:main"
-labgrid-scheduler = "kernelci_labgrid.scheduler.push_scheduler:main"
 
 [project.urls]
 Homepage = "https://github.com/kernelci/kernelci-labgrid"
@@ -65,14 +55,12 @@ packages = ["src/kernelci_labgrid"]
 [tool.hatch.build.targets.sdist]
 include = [
     "/src",
-    "/config",
     "/tests",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-v --cov=kernelci_labgrid --cov-report=term-missing"
 
 [tool.mypy]
 python_version = "3.10"
