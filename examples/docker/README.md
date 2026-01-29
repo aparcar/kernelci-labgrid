@@ -25,6 +25,14 @@ This example sets up a complete KernelCI Labgrid testing environment for OpenWrt
 │  │                        │   - Reports results           │   │
 │  └────────────────────────┴────────────────────────────────┘   │
 │                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              job-scheduler (optional)                   │   │
+│  │                                                         │   │
+│  │  Submits test jobs to KernelCI every 24 hours:         │   │
+│  │  - Fetches latest OpenWrt x86_64 images                │   │
+│  │  - Creates test jobs for main and 25.12 branches       │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -65,6 +73,48 @@ docker compose exec labgrid-exporter labgrid-client -p openwrt-main-x86 show
 # Check agent is polling
 docker compose logs labgrid-agent | tail -20
 ```
+
+## Scheduling Test Jobs
+
+There are multiple ways to schedule periodic test jobs:
+
+### Option 1: Built-in Scheduler Service
+
+Start the scheduler service to automatically submit jobs every 24 hours:
+
+```bash
+# Start with scheduler enabled
+docker compose --profile scheduler up -d
+
+# View scheduler logs
+docker compose logs -f job-scheduler
+
+# Stop scheduler
+docker compose --profile scheduler down
+```
+
+### Option 2: Manual Trigger (for host cron)
+
+Submit jobs once using the trigger service:
+
+```bash
+# Submit jobs for latest OpenWrt images
+docker compose --profile trigger run --rm job-trigger
+```
+
+Add to host crontab for scheduled execution:
+
+```bash
+# Edit crontab
+crontab -e
+
+# Add daily job at 2 AM
+0 2 * * * cd /path/to/examples/docker && docker compose --profile trigger run --rm job-trigger
+```
+
+### Option 3: KernelCI Native Pipeline
+
+For full integration with KernelCI's Maestro pipeline, configure your KernelCI instance to monitor OpenWrt builds directly. See [KernelCI Pipeline documentation](https://kernelci.org/docs/).
 
 ## Testing Locally
 
@@ -112,6 +162,8 @@ docker/
 ├── health_checks/         # Health check configurations
 │   ├── openwrt-main-x86.yaml
 │   └── openwrt-2512-x86.yaml
+├── scripts/               # Utility scripts
+│   └── job_scheduler.py   # Periodic job submission
 └── tests/                 # Pytest tests
     ├── conftest.py
     ├── test_openwrt.py

@@ -91,6 +91,41 @@ services:
     restart: unless-stopped
 
   # ==========================================================================
+  # Job Scheduler - submits test jobs periodically
+  # ==========================================================================
+  # Option 1: Use this service for continuous scheduling (every N hours)
+  job-scheduler:
+    build:
+      context: ../..
+      dockerfile: examples/docker/Dockerfile
+    container_name: job-scheduler
+    profiles:
+      - scheduler  # Only starts with: docker compose --profile scheduler up
+    environment:
+      - KCI_API_URL=${KCI_API_URL:-https://api.kernelci.org}
+      - KCI_API_TOKEN=${KCI_API_TOKEN:?KCI_API_TOKEN is required}
+      - LAB_NAME=${LAB_NAME:-openwrt-qemu-lab}
+    command: >
+      python /opt/scripts/job_scheduler.py
+        --interval ${SCHEDULER_INTERVAL:-24}
+    restart: unless-stopped
+
+  # Option 2: Or use host cron to trigger jobs manually:
+  #   docker compose run --rm job-trigger
+  job-trigger:
+    build:
+      context: ../..
+      dockerfile: examples/docker/Dockerfile
+    container_name: job-trigger
+    profiles:
+      - trigger  # Only runs with: docker compose --profile trigger run job-trigger
+    environment:
+      - KCI_API_URL=${KCI_API_URL:-https://api.kernelci.org}
+      - KCI_API_TOKEN=${KCI_API_TOKEN:?KCI_API_TOKEN is required}
+      - LAB_NAME=${LAB_NAME:-openwrt-qemu-lab}
+    command: python /opt/scripts/job_scheduler.py --once
+
+  # ==========================================================================
   # Optional: OpenWrt image builder (for creating test images)
   # ==========================================================================
   # openwrt-imagebuilder:
