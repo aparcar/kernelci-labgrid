@@ -2,7 +2,6 @@
 
 import pytest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 from kernelci_labgrid.scheduler.pull_agent import (
     LabgridPullAgent,
@@ -125,8 +124,8 @@ class TestFindTargetYaml:
         assert result is None
 
 
-class TestParsePytestOutput:
-    """Tests for pytest output parsing."""
+class TestParseJunitXml:
+    """Tests for JUnit XML parsing."""
 
     @pytest.fixture
     def agent(self, tmp_path):
@@ -135,52 +134,119 @@ class TestParsePytestOutput:
             api_token="token",
             lab_name="lab",
             tests_dir=tmp_path,
+            artifact_dir=tmp_path / "artifacts",
         )
 
-    def test_parse_summary_line(self, agent):
-        output = """
-============================= test session starts ==============================
-collected 10 items
+    def test_parse_basic_junit(self, agent, tmp_path):
+        junit_xml = tmp_path / "results.xml"
+        junit_xml.write_text("""<?xml version="1.0" encoding="utf-8"?>
+<testsuite name="pytest" tests="3" errors="0" failures="1" skipped="0" time="5.5">
+    <testcase classname="test_boot" name="test_login" time="1.2"/>
+    <testcase classname="test_boot" name="test_network" time="2.3">
+        <failure message="AssertionError">assert False</failure>
+    </testcase>
+    <testcase classname="test_boot" name="test_memory" time="2.0"/>
+</testsuite>
+""")
 
-test_boot.py::test_login PASSED
-test_boot.py::test_network FAILED
+        result = agent._parse_junit_xml(junit_xml)
 
-========================= 8 passed, 2 failed in 5.23s =========================
-"""
-        result = agent._parse_pytest_output(output)
-
-        assert result.passed == 8
-        assert result.failed == 2
-        assert result.duration == 5.23
-
-    def test_parse_with_skipped(self, agent):
-        output = "3 passed, 1 failed, 2 skipped in 10.5s"
-        result = agent._parse_pytest_output(output)
-
-        assert result.passed == 3
+        assert result.total == 3
+        assert result.passed == 2
         assert result.failed == 1
-        assert result.skipped == 2
+        assert result.skipped == 0
+        assert result.duration == 5.5
+        assert len(result.test_cases) == 3
 
-    def test_empty_output(self, agent):
-        result = agent._parse_pytest_output("")
-        assert result.passed == 0
+    def test_parse_with_skipped(self, agent, tmp_path):
+        junit_xml = tmp_path / "results.xml"
+        junit_xml.write_text("""<?xml version="1.0" encoding="utf-8"?>
+<testsuite name="pytest" tests="3" errors="0" failures="0" skipped="1" time="3.0">
+    <testcase classname="test_boot" name="test_login" time="1.0"/>
+    <testcase classname="test_boot" name="test_skip" time="0.1">
+        <skipped message="not implemented"/>
+    </testcase>
+    <testcase classname="test_boot" name="test_other" time="1.9"/>
+</testsuite>
+""")
+
+        result = agent._parse_junit_xml(junit_xml)
+
+        assert result.total == 3
+        assert result.passed == 2
+        assert result.skipped == 1
         assert result.failed == 0
+
+    def test_parse_with_errors(self, agent, tmp_path):
+        junit_xml = tmp_path / "results.xml"
+        junit_xml.write_text("""<?xml version="1.0" encoding="utf-8"?>
+<testsuite name="pytest" tests="2" errors="1" failures="0" skipped="0" time="1.0">
+    <testcase classname="test_boot" name="test_login" time="0.5"/>
+    <testcase classname="test_boot" name="test_crash" time="0.5">
+        <error message="RuntimeError">Traceback...</error>
+    </testcase>
+</testsuite>
+""")
+
+        result = agent._parse_junit_xml(junit_xml)
+
+        assert result.total == 2
+        assert result.errors == 1
+        assert result.result == "incomplete"
+
+    def test_parse_missing_file(self, agent, tmp_path):
+        result = agent._parse_junit_xml(tmp_path / "nonexistent.xml")
+
+        assert result.total == 0
+        assert result.passed == 0
+
+    def test_parse_testsuites_wrapper(self, agent, tmp_path):
+        """Test parsing when root is <testsuites> (multiple suites)."""
+        junit_xml = tmp_path / "results.xml"
+        junit_xml.write_text("""<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+    <testsuite name="suite1" tests="2" errors="0" failures="0" skipped="0" time="1.0">
+        <testcase classname="test_a" name="test_1" time="0.5"/>
+        <testcase classname="test_a" name="test_2" time="0.5"/>
+    </testsuite>
+    <testsuite name="suite2" tests="1" errors="0" failures="1" skipped="0" time="0.5">
+        <testcase classname="test_b" name="test_3" time="0.5">
+            <failure message="failed"/>
+        </testcase>
+    </testsuite>
+</testsuites>
+""")
+
+        result = agent._parse_junit_xml(junit_xml)
+
+        assert result.total == 3
+        assert result.passed == 2
+        assert result.failed == 1
 
 
 class TestMapOutcome:
-    """Tests for pytest outcome mapping."""
+    """Tests for pytest/JUnit outcome mapping."""
 
-    def test_passed(self):
+    def test_junit_pass(self):
+        assert LabgridPullAgent._map_outcome("pass") == "pass"
+
+    def test_junit_fail(self):
+        assert LabgridPullAgent._map_outcome("fail") == "fail"
+
+    def test_junit_skip(self):
+        assert LabgridPullAgent._map_outcome("skip") == "skip"
+
+    def test_junit_error(self):
+        assert LabgridPullAgent._map_outcome("error") == "incomplete"
+
+    def test_pytest_passed(self):
         assert LabgridPullAgent._map_outcome("passed") == "pass"
 
-    def test_failed(self):
+    def test_pytest_failed(self):
         assert LabgridPullAgent._map_outcome("failed") == "fail"
 
-    def test_skipped(self):
+    def test_pytest_skipped(self):
         assert LabgridPullAgent._map_outcome("skipped") == "skip"
-
-    def test_error(self):
-        assert LabgridPullAgent._map_outcome("error") == "incomplete"
 
     def test_unknown(self):
         assert LabgridPullAgent._map_outcome("unknown") == "skip"

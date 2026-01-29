@@ -12,13 +12,12 @@ No modifications needed to KernelCI infrastructure.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import shutil
 import signal
-import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -353,9 +352,12 @@ class LabgridPullAgent:
         artifacts: dict[str, Path],
         job_data: dict[str, Any],
     ) -> TestResult:
-        """Run pytest with labgrid environment."""
+        """Run pytest with labgrid environment, output JUnit XML."""
         timeout = job_data.get("timeout", self.default_timeout)
         test_path = job_data.get("test_path", "")  # specific test file/dir
+
+        # Create temp file for JUnit XML output
+        junit_xml = self.artifact_dir / f"junit-{os.getpid()}.xml"
 
         # Build pytest command
         cmd = [
@@ -363,11 +365,10 @@ class LabgridPullAgent:
             "--lg-env", str(target_yaml),
             "--tb=short",
             "-v",
-            "--json-report",
-            "--json-report-file=-",  # Output to stdout
+            f"--junit-xml={junit_xml}",  # JUnit XML output
         ]
 
-        # Add artifact paths as environment/options
+        # Add artifact paths as environment variables
         env = os.environ.copy()
         if "kernel" in artifacts:
             env["LG_KERNEL"] = str(artifacts["kernel"])
@@ -410,64 +411,114 @@ class LabgridPullAgent:
         except Exception as e:
             return TestResult(errors=1, output=str(e))
 
-        # Parse results
-        return self._parse_pytest_output(output)
+        # Parse JUnit XML results
+        result = self._parse_junit_xml(junit_xml)
+        result.output = output
 
-    def _parse_pytest_output(self, output: str) -> TestResult:
-        """Parse pytest output for results."""
-        result = TestResult(output=output)
+        # Cleanup
+        if junit_xml.exists():
+            junit_xml.unlink()
 
-        # Try to parse JSON report if available
+        return result
+
+    def _parse_junit_xml(self, junit_xml: Path) -> TestResult:
+        """Parse JUnit XML output from pytest.
+
+        JUnit XML format:
+        <testsuites>
+          <testsuite name="pytest" tests="5" errors="0" failures="1" skipped="1" time="10.5">
+            <testcase classname="test_boot" name="test_login" time="1.2"/>
+            <testcase classname="test_boot" name="test_network" time="2.3">
+              <failure message="AssertionError">...</failure>
+            </testcase>
+            <testcase classname="test_boot" name="test_skip" time="0.1">
+              <skipped message="reason"/>
+            </testcase>
+          </testsuite>
+        </testsuites>
+        """
+        result = TestResult()
+
+        if not junit_xml.exists():
+            logger.warning(f"JUnit XML file not found: {junit_xml}")
+            return result
+
         try:
-            # Look for JSON in output (pytest-json-report outputs to stdout with --)
-            for line in output.split("\n"):
-                line = line.strip()
-                if line.startswith("{") and '"summary"' in line:
-                    data = json.loads(line)
-                    summary = data.get("summary", {})
-                    result.passed = summary.get("passed", 0)
-                    result.failed = summary.get("failed", 0)
-                    result.skipped = summary.get("skipped", 0)
-                    result.errors = summary.get("error", 0)
-                    result.total = summary.get("total", 0)
-                    result.duration = data.get("duration", 0)
+            tree = ET.parse(junit_xml)
+            root = tree.getroot()
 
-                    # Extract test cases
-                    for test in data.get("tests", []):
-                        result.test_cases.append({
-                            "name": test.get("nodeid", "").split("::")[-1],
-                            "result": test.get("outcome", "unknown"),
-                            "duration": test.get("duration", 0),
-                        })
-                    return result
-        except (json.JSONDecodeError, KeyError):
-            pass
+            # Handle both <testsuites> and <testsuite> as root
+            if root.tag == "testsuites":
+                testsuites = root.findall("testsuite")
+            else:
+                testsuites = [root]
 
-        # Fallback: parse text output
-        for line in output.split("\n"):
-            # Match summary line: "5 passed, 2 failed, 1 skipped in 10.5s"
-            if " passed" in line or " failed" in line:
-                import re
-                if match := re.search(r"(\d+) passed", line):
-                    result.passed = int(match.group(1))
-                if match := re.search(r"(\d+) failed", line):
-                    result.failed = int(match.group(1))
-                if match := re.search(r"(\d+) skipped", line):
-                    result.skipped = int(match.group(1))
-                if match := re.search(r"(\d+) error", line):
-                    result.errors = int(match.group(1))
-                if match := re.search(r"in ([\d.]+)s", line):
-                    result.duration = float(match.group(1))
+            for testsuite in testsuites:
+                # Get summary from testsuite attributes
+                result.total += int(testsuite.get("tests", 0))
+                result.errors += int(testsuite.get("errors", 0))
+                result.failed += int(testsuite.get("failures", 0))
+                result.skipped += int(testsuite.get("skipped", 0))
+                result.duration += float(testsuite.get("time", 0))
 
-        result.total = result.passed + result.failed + result.skipped + result.errors
+                # Parse individual test cases
+                for testcase in testsuite.findall("testcase"):
+                    name = testcase.get("name", "unknown")
+                    classname = testcase.get("classname", "")
+                    duration = float(testcase.get("time", 0))
+
+                    # Determine result from child elements
+                    if testcase.find("failure") is not None:
+                        tc_result = "fail"
+                        failure = testcase.find("failure")
+                        message = failure.get("message", "") if failure is not None else ""
+                    elif testcase.find("error") is not None:
+                        tc_result = "error"
+                        error = testcase.find("error")
+                        message = error.get("message", "") if error is not None else ""
+                    elif testcase.find("skipped") is not None:
+                        tc_result = "skip"
+                        skipped = testcase.find("skipped")
+                        message = skipped.get("message", "") if skipped is not None else ""
+                    else:
+                        tc_result = "pass"
+                        message = ""
+
+                    result.test_cases.append({
+                        "name": name,
+                        "classname": classname,
+                        "result": tc_result,
+                        "duration": duration,
+                        "message": message,
+                    })
+
+            # Calculate passed from total - (failed + errors + skipped)
+            result.passed = result.total - result.failed - result.errors - result.skipped
+
+        except ET.ParseError as e:
+            logger.error(f"Failed to parse JUnit XML: {e}")
+            result.errors = 1
+
         return result
 
     # ==================== Result Reporting ====================
 
     async def _report_results(self, node_id: str, result: TestResult) -> None:
         """Report test results to KernelCI API."""
-        # Create test case nodes
+        # Create test case nodes from JUnit XML data
         for tc in result.test_cases:
+            tc_data: dict[str, Any] = {
+                "duration": tc.get("duration", 0),
+            }
+
+            # Include failure/error message if present
+            if tc.get("message"):
+                tc_data["error_msg"] = tc["message"]
+
+            # Include classname for grouping
+            if tc.get("classname"):
+                tc_data["classname"] = tc["classname"]
+
             try:
                 await self._api_post(
                     "/api/latest/nodes",
@@ -477,13 +528,13 @@ class LabgridPullAgent:
                         "kind": "test_case",
                         "state": "done",
                         "result": self._map_outcome(tc.get("result", "")),
-                        "data": {"duration": tc.get("duration", 0)},
+                        "data": tc_data,
                     },
                 )
             except Exception as e:
                 logger.warning(f"Failed to create test case node: {e}")
 
-        # Update job node
+        # Update job node with summary
         await self._api_put(
             f"/api/latest/nodes/{node_id}",
             {
@@ -493,6 +544,8 @@ class LabgridPullAgent:
                     "passed": result.passed,
                     "failed": result.failed,
                     "skipped": result.skipped,
+                    "errors": result.errors,
+                    "total": result.total,
                     "duration": result.duration,
                 },
             },
@@ -514,12 +567,17 @@ class LabgridPullAgent:
 
     @staticmethod
     def _map_outcome(outcome: str) -> str:
-        """Map pytest outcome to KernelCI result."""
+        """Map pytest/JUnit outcome to KernelCI result."""
         mapping = {
+            # JUnit XML outcomes
+            "pass": "pass",
+            "fail": "fail",
+            "skip": "skip",
+            "error": "incomplete",
+            # pytest outcomes
             "passed": "pass",
             "failed": "fail",
             "skipped": "skip",
-            "error": "incomplete",
             "xfailed": "skip",
             "xpassed": "pass",
         }
