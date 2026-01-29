@@ -1,0 +1,78 @@
+# Example Labgrid Environment File
+#
+# This file can be used for local test development with pytest-labgrid.
+# It defines targets that can be used without a coordinator.
+#
+# Usage:
+#   pytest --lg-env environment.yaml test_myboard.py
+#
+# For coordinator-based testing, the environment is built dynamically
+# from the coordinator's place/resource information.
+
+targets:
+  # Raspberry Pi 4 target
+  rpi4-board:
+    # Resource definitions
+    resources:
+      # Serial console
+      RawSerialPort:
+        port: "/dev/ttyUSB0"
+        speed: 115200
+
+      # SSH access
+      NetworkService:
+        address: "192.168.1.50"
+        username: "root"
+
+      # Power control
+      NetworkPowerPort:
+        model: "netio"
+        host: "pdu.local"
+        index: 1
+
+    # Driver bindings
+    drivers:
+      # Console driver using serial
+      SerialDriver:
+        # Automatically binds to RawSerialPort
+
+      # Shell driver for command execution
+      ShellDriver:
+        prompt: 'root@.*# '
+        login_prompt: ' login: '
+        username: 'root'
+        password: ''
+
+      # Power driver
+      NetworkPowerDriver:
+        # Automatically binds to NetworkPowerPort
+
+      # SSH driver for network access
+      SSHDriver:
+        # Automatically binds to NetworkService
+
+  # QEMU target for CI/local testing
+  qemu-arm64:
+    resources:
+      QEMUDriver:
+        qemu_bin: "qemu-system-aarch64"
+        machine: "virt"
+        cpu: "cortex-a72"
+        memory: "2G"
+        extra_args: >-
+          -nographic
+          -kernel {kernel}
+          -append "console=ttyAMA0 root=/dev/vda rw"
+
+    drivers:
+      QEMUDriver:
+        # QEMU specific driver
+
+      ShellDriver:
+        prompt: '# '
+        login_prompt: ' login: '
+        username: 'root'
+
+# Import statements for shared configurations
+# imports:
+#   - common-drivers.yaml

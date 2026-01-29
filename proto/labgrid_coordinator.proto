@@ -1,0 +1,366 @@
+// Labgrid Coordinator gRPC Protocol
+// Based on labgrid v25.0+ gRPC interface
+// Reference: https://github.com/labgrid-project/labgrid
+
+syntax = "proto3";
+
+package labgrid.coordinator;
+
+option python_generic_services = true;
+
+// Main coordinator service
+service Coordinator {
+    // Bidirectional streaming for exporters
+    rpc ExporterStream(stream ExporterInMessage) returns (stream ExporterOutMessage);
+
+    // Bidirectional streaming for clients
+    rpc ClientStream(stream ClientInMessage) returns (stream ClientOutMessage);
+
+    // Place management
+    rpc GetPlaces(GetPlacesRequest) returns (GetPlacesResponse);
+    rpc GetPlace(GetPlaceRequest) returns (GetPlaceResponse);
+    rpc AddPlace(AddPlaceRequest) returns (AddPlaceResponse);
+    rpc DeletePlace(DeletePlaceRequest) returns (DeletePlaceResponse);
+    rpc SetPlaceTags(SetPlaceTagsRequest) returns (SetPlaceTagsResponse);
+
+    // Resource management
+    rpc GetResources(GetResourcesRequest) returns (GetResourcesResponse);
+    rpc AddPlaceAlias(AddPlaceAliasRequest) returns (AddPlaceAliasResponse);
+    rpc DeletePlaceAlias(DeletePlaceAliasRequest) returns (DeletePlaceAliasResponse);
+    rpc SetPlaceComment(SetPlaceCommentRequest) returns (SetPlaceCommentResponse);
+    rpc AddPlaceMatch(AddPlaceMatchRequest) returns (AddPlaceMatchResponse);
+    rpc DeletePlaceMatch(DeletePlaceMatchRequest) returns (DeletePlaceMatchResponse);
+
+    // Reservation management
+    rpc CreateReservation(CreateReservationRequest) returns (CreateReservationResponse);
+    rpc CancelReservation(CancelReservationRequest) returns (CancelReservationResponse);
+    rpc PollReservation(PollReservationRequest) returns (PollReservationResponse);
+    rpc GetReservations(GetReservationsRequest) returns (GetReservationsResponse);
+
+    // Acquire/Release operations
+    rpc AcquirePlace(AcquirePlaceRequest) returns (AcquirePlaceResponse);
+    rpc ReleasePlace(ReleasePlaceRequest) returns (ReleasePlaceResponse);
+    rpc AllowPlace(AllowPlaceRequest) returns (AllowPlaceResponse);
+
+    // Utility
+    rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+}
+
+// ============ Message Types ============
+
+// Version
+message GetVersionRequest {}
+message GetVersionResponse {
+    string version = 1;
+}
+
+// ============ Place Messages ============
+
+message Place {
+    string name = 1;
+    repeated string aliases = 2;
+    string comment = 3;
+    map<string, string> tags = 4;
+    repeated PlaceMatch matches = 5;
+    string acquired = 6;  // Empty if not acquired, otherwise client name
+    repeated string allowed = 7;
+    int64 created = 8;
+    int64 changed = 9;
+    string reservation = 10;  // Reservation token if reserved
+}
+
+message PlaceMatch {
+    string exporter = 1;
+    string group = 2;
+    string cls = 3;  // Resource class
+    string name = 4;
+    bool rename = 5;
+}
+
+message GetPlacesRequest {
+    // Optional filter
+    map<string, string> filter = 1;
+}
+
+message GetPlacesResponse {
+    repeated Place places = 1;
+}
+
+message GetPlaceRequest {
+    string name = 1;
+}
+
+message GetPlaceResponse {
+    Place place = 1;
+}
+
+message AddPlaceRequest {
+    string name = 1;
+}
+
+message AddPlaceResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message DeletePlaceRequest {
+    string name = 1;
+}
+
+message DeletePlaceResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message SetPlaceTagsRequest {
+    string name = 1;
+    map<string, string> tags = 2;
+}
+
+message SetPlaceTagsResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message AddPlaceAliasRequest {
+    string name = 1;
+    string alias = 2;
+}
+
+message AddPlaceAliasResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message DeletePlaceAliasRequest {
+    string name = 1;
+    string alias = 2;
+}
+
+message DeletePlaceAliasResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message SetPlaceCommentRequest {
+    string name = 1;
+    string comment = 2;
+}
+
+message SetPlaceCommentResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message AddPlaceMatchRequest {
+    string name = 1;
+    string pattern = 2;
+    bool rename = 3;
+}
+
+message AddPlaceMatchResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message DeletePlaceMatchRequest {
+    string name = 1;
+    string pattern = 2;
+}
+
+message DeletePlaceMatchResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// ============ Resource Messages ============
+
+message Resource {
+    string exporter = 1;
+    string group = 2;
+    string cls = 3;  // Resource class name
+    string name = 4;
+    map<string, string> params = 5;
+    map<string, string> extra = 6;
+    bool acquired = 7;
+    bool avail = 8;
+}
+
+message GetResourcesRequest {
+    // Optional filter
+    map<string, string> filter = 1;
+}
+
+message GetResourcesResponse {
+    repeated Resource resources = 1;
+}
+
+// ============ Reservation Messages ============
+
+message Reservation {
+    string owner = 1;
+    string token = 2;
+    int32 state = 3;  // 0=waiting, 1=allocated, 2=acquired, 3=expired, 4=invalid
+    string prio = 4;
+    map<string, string> filters = 5;
+    map<string, string> allocations = 6;  // filter_name -> place_name
+    int64 created = 7;
+    int64 timeout = 8;
+}
+
+message CreateReservationRequest {
+    map<string, string> filters = 1;
+    string prio = 2;
+}
+
+message CreateReservationResponse {
+    Reservation reservation = 1;
+}
+
+message CancelReservationRequest {
+    string token = 1;
+}
+
+message CancelReservationResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message PollReservationRequest {
+    string token = 1;
+}
+
+message PollReservationResponse {
+    Reservation reservation = 1;
+}
+
+message GetReservationsRequest {}
+
+message GetReservationsResponse {
+    repeated Reservation reservations = 1;
+}
+
+// ============ Acquire/Release Messages ============
+
+message AcquirePlaceRequest {
+    string name = 1;
+}
+
+message AcquirePlaceResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message ReleasePlaceRequest {
+    string name = 1;
+}
+
+message ReleasePlaceResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message AllowPlaceRequest {
+    string name = 1;
+    string user = 2;
+}
+
+message AllowPlaceResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// ============ Streaming Messages ============
+
+// Exporter streaming messages
+message ExporterInMessage {
+    oneof kind {
+        ExporterSetResourceMessage set_resource = 1;
+        ExporterStartupDone startup_done = 2;
+        ExporterResponse response = 3;
+    }
+}
+
+message ExporterOutMessage {
+    oneof kind {
+        ExporterSetAcquiredRequest set_acquired = 1;
+        ExporterRequest request = 2;
+    }
+}
+
+message ExporterSetResourceMessage {
+    string group = 1;
+    string name = 2;
+    Resource resource = 3;  // null to remove
+}
+
+message ExporterStartupDone {}
+
+message ExporterSetAcquiredRequest {
+    string group = 1;
+    string name = 2;
+    string place = 3;  // Empty to release
+}
+
+message ExporterRequest {
+    int64 id = 1;
+    string method = 2;
+    bytes args = 3;  // JSON-encoded arguments
+}
+
+message ExporterResponse {
+    int64 id = 1;
+    bool success = 2;
+    bytes result = 3;  // JSON-encoded result
+    string error = 4;
+}
+
+// Client streaming messages
+message ClientInMessage {
+    oneof kind {
+        ClientSyncMessage sync = 1;
+        ClientSubscribeMessage subscribe = 2;
+    }
+}
+
+message ClientOutMessage {
+    oneof kind {
+        ClientUpdateMessage update = 1;
+    }
+}
+
+message ClientSyncMessage {
+    int64 id = 1;
+}
+
+message ClientSubscribeMessage {
+    bool places = 1;
+    bool resources = 2;
+    bool reservations = 3;
+}
+
+message ClientUpdateMessage {
+    oneof kind {
+        Place place = 1;
+        Resource resource = 2;
+        Reservation reservation = 3;
+        PlaceDeleted place_deleted = 4;
+        ResourceDeleted resource_deleted = 5;
+        ReservationDeleted reservation_deleted = 6;
+    }
+}
+
+message PlaceDeleted {
+    string name = 1;
+}
+
+message ResourceDeleted {
+    string exporter = 1;
+    string group = 2;
+    string cls = 3;
+    string name = 4;
+}
+
+message ReservationDeleted {
+    string token = 1;
+}

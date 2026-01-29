@@ -1,0 +1,122 @@
+# KernelCI Labgrid Runtime Configuration
+# This file defines Labgrid lab connections and platform mappings
+
+runtimes:
+  # Example: Pengutronix Labgrid lab
+  labgrid-pengutronix:
+    lab_type: labgrid
+    coordinator_address: "labgrid.pengutronix.de:20408"
+    mode: push  # 'push' for accessible coordinators, 'pull' for firewalled labs
+    secure: false
+
+    # Authentication configuration
+    auth:
+      type: token  # none, token, or mtls
+      token: "${LABGRID_TOKEN}"  # Environment variable expansion
+
+    # SSH configuration for test execution
+    ssh:
+      proxy_host: "labgrid-proxy.pengutronix.de"
+      proxy_user: "testrunner"
+      key_file: "/etc/kernelci/labgrid-ssh-key"
+      timeout: 30
+
+    # Artifact storage configuration
+    storage:
+      type: ssh  # http, ssh, or nfs
+      host: "storage.pengutronix.de"
+      path: "/srv/kernelci/artifacts"
+      user: "artifacts"
+      key_file: "/etc/kernelci/storage-ssh-key"
+
+    # Platform to place mapping
+    place_mapping:
+      - place: rpi4-slot1
+        platform: bcm2711-rpi-4-b
+        compatible:
+          - "brcm,bcm2711"
+        tags:
+          arch: arm64
+          memory: "4GB"
+
+      - place: rpi4-slot2
+        platform: bcm2711-rpi-4-b
+        compatible:
+          - "brcm,bcm2711"
+        tags:
+          arch: arm64
+          memory: "8GB"
+
+      - place: imx8mm-board1
+        platform: imx8mm-evk
+        compatible:
+          - "fsl,imx8mm-evk"
+          - "fsl,imx8mm"
+        tags:
+          arch: arm64
+          vendor: nxp
+
+  # Example: Local development lab (pull mode)
+  labgrid-local:
+    lab_type: labgrid
+    coordinator_address: "localhost:20408"
+    mode: pull  # Agent polls API for jobs
+
+    ssh:
+      proxy_host: null  # Direct access
+      proxy_user: "root"
+      key_file: "~/.ssh/id_rsa"
+
+    storage:
+      type: local
+      path: "/tmp/labgrid-artifacts"
+
+    place_mapping:
+      - place: qemu-arm64
+        platform: qemu-arm64
+        compatible:
+          - "linux,dummy-virt"
+        tags:
+          type: qemu
+          arch: arm64
+
+  # Example: Collabora lab
+  labgrid-collabora:
+    lab_type: labgrid
+    coordinator_address: "labgrid.collabora.com:20408"
+    mode: push
+    secure: true
+
+    auth:
+      type: mtls
+      cert_file: "/etc/kernelci/collabora-cert.pem"
+      key_file: "/etc/kernelci/collabora-key.pem"
+      ca_file: "/etc/kernelci/collabora-ca.pem"
+
+    ssh:
+      proxy_host: "jump.collabora.com"
+      proxy_user: "kernelci"
+      key_file: "/etc/kernelci/collabora-ssh-key"
+
+    storage:
+      type: http
+      # Artifacts accessible via HTTP - no upload needed
+
+    place_mapping:
+      - place: rk3399-rock-pi-4
+        platform: rk3399-rock-pi-4
+        compatible:
+          - "radxa,rock-pi-4"
+          - "rockchip,rk3399"
+        tags:
+          arch: arm64
+          vendor: rockchip
+
+      - place: sun50i-a64-pine64
+        platform: sun50i-a64-pine64
+        compatible:
+          - "pine64,pine64"
+          - "allwinner,sun50i-a64"
+        tags:
+          arch: arm64
+          vendor: allwinner

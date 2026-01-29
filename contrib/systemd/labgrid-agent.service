@@ -1,0 +1,48 @@
+[Unit]
+Description=KernelCI Labgrid Pull Agent
+Documentation=https://github.com/kernelci/kernelci-labgrid
+After=network-online.target labgrid-coordinator.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kernelci
+Group=kernelci
+
+# Configuration
+Environment="KCI_API_URL=https://api.kernelci.org"
+Environment="LABGRID_COORDINATOR=localhost:20408"
+EnvironmentFile=-/etc/kernelci/labgrid-agent.env
+
+# Working directory
+WorkingDirectory=/opt/kernelci-labgrid
+
+# Start command
+ExecStart=/usr/local/bin/labgrid-pull-agent \
+    --lab-name ${LAB_NAME} \
+    --coordinator ${LABGRID_COORDINATOR} \
+    --poll-interval 30
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# Allow write to artifact directory
+ReadWritePaths=/var/lib/kernelci/artifacts
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=labgrid-agent
+
+[Install]
+WantedBy=multi-user.target

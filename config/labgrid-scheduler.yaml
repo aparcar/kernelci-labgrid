@@ -1,0 +1,126 @@
+# KernelCI Labgrid Scheduler Configuration
+# This file defines which test jobs to trigger based on build events
+
+scheduler:
+  # Baseline boot test on ARM64 boards
+  - job: baseline-arm64
+    event:
+      channel: node
+      name: kbuild-gcc-12-arm64  # Match build node name
+      result: pass               # Trigger on successful build
+    runtime:
+      type: labgrid
+      name: labgrid-pengutronix
+    platforms:
+      - bcm2711-rpi-4-b
+      - imx8mm-evk
+    test_suite: baseline
+    timeout: 1800  # 30 minutes
+    priority: 50
+
+  # Baseline boot test on Rockchip boards
+  - job: baseline-arm64-rockchip
+    event:
+      channel: node
+      name: kbuild-gcc-12-arm64
+      result: pass
+    runtime:
+      type: labgrid
+      name: labgrid-collabora
+    platforms:
+      - rk3399-rock-pi-4
+    test_suite: baseline
+    timeout: 1800
+    priority: 50
+
+  # Allwinner-specific tests
+  - job: baseline-arm64-allwinner
+    event:
+      channel: node
+      name: kbuild-gcc-12-arm64-allwinner*  # Wildcard matching
+      result: pass
+    runtime:
+      type: labgrid
+      name: labgrid-collabora
+    platforms:
+      - sun50i-a64-pine64
+    test_suite: baseline
+    timeout: 1800
+    priority: 50
+
+  # Kernel self-tests on RPi4
+  - job: kselftest-timers
+    event:
+      channel: node
+      name: kbuild-gcc-12-arm64
+      result: pass
+    runtime:
+      type: labgrid
+      name: labgrid-pengutronix
+    platforms:
+      - bcm2711-rpi-4-b
+    test_suite: kselftest
+    test_config:
+      test_name: timers
+      timeout: 600
+    timeout: 3600
+    priority: 40  # Lower priority than baseline
+
+  # Memory management self-tests
+  - job: kselftest-mm
+    event:
+      channel: node
+      name: kbuild-gcc-12-arm64
+      result: pass
+    runtime:
+      type: labgrid
+      name: labgrid-pengutronix
+    platforms:
+      - bcm2711-rpi-4-b
+    test_suite: kselftest
+    test_config:
+      test_name: mm
+      timeout: 1800
+    timeout: 7200
+    priority: 30
+
+  # i.MX-specific tests
+  - job: imx-thermal-test
+    event:
+      channel: node
+      name: kbuild-gcc-12-arm64-imx*
+      result: pass
+    runtime:
+      type: labgrid
+      name: labgrid-pengutronix
+    platforms:
+      - imx8mm-evk
+    test_suite: custom
+    test_config:
+      commands:
+        - name: thermal_zones
+          command: "cat /sys/class/thermal/thermal_zone*/type"
+          description: "List thermal zones"
+        - name: thermal_temp
+          command: "cat /sys/class/thermal/thermal_zone0/temp"
+          description: "Read CPU temperature"
+        - name: cpufreq_scaling
+          command: "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies"
+          description: "Check CPU frequency scaling"
+    timeout: 600
+    priority: 40
+
+  # QEMU virtual tests (local development)
+  - job: qemu-baseline
+    event:
+      channel: node
+      name: kbuild-gcc-12-arm64
+      result: pass
+    runtime:
+      type: labgrid
+      name: labgrid-local
+    platforms:
+      - qemu-arm64
+    test_suite: baseline
+    timeout: 900
+    priority: 60  # Higher priority for quick feedback
