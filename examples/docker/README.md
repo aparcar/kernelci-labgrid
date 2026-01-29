@@ -33,6 +33,15 @@ This example sets up a complete KernelCI Labgrid testing environment for OpenWrt
 │  │  - Creates test jobs for main and 25.12 branches       │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              build-monitor (optional)                   │   │
+│  │                                                         │   │
+│  │  Maestro pipeline integration:                         │   │
+│  │  - Monitors version.buildinfo for new builds           │   │
+│  │  - Creates checkout nodes in KernelCI                  │   │
+│  │  - Triggers test jobs automatically                    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -112,9 +121,31 @@ crontab -e
 0 2 * * * cd /path/to/examples/docker && docker compose --profile trigger run --rm job-trigger
 ```
 
-### Option 3: KernelCI Native Pipeline
+### Option 3: Build Monitor (Maestro Integration)
 
-For full integration with KernelCI's Maestro pipeline, configure your KernelCI instance to monitor OpenWrt builds directly. See [KernelCI Pipeline documentation](https://kernelci.org/docs/).
+The build monitor watches OpenWrt downloads for new builds by checking the
+`version.buildinfo` file. When a new build is detected, it creates a checkout
+node in KernelCI, which triggers the test pipeline automatically.
+
+```bash
+# Start with build monitor enabled
+docker compose --profile pipeline up -d
+
+# View build monitor logs
+docker compose logs -f build-monitor
+
+# Check once and exit
+docker compose --profile pipeline run --rm build-monitor python /opt/scripts/build_monitor.py --once
+```
+
+How it works:
+1. Polls `https://downloads.openwrt.org/.../version.buildinfo` every hour
+2. Detects version changes (e.g., `r24106-10cc5fcd00` → `r24107-abc1234def`)
+3. Creates a checkout node in KernelCI with the new build info
+4. Creates a test job node linked to the checkout
+5. The labgrid-agent picks up the job and runs tests
+
+This integrates with KernelCI's [Maestro pipeline](https://docs.kernelci.org/maestro/) architecture.
 
 ## Testing Locally
 
@@ -163,7 +194,8 @@ docker/
 │   ├── openwrt-main-x86.yaml
 │   └── openwrt-2512-x86.yaml
 ├── scripts/               # Utility scripts
-│   └── job_scheduler.py   # Periodic job submission
+│   ├── job_scheduler.py   # Periodic job submission
+│   └── build_monitor.py   # Maestro pipeline integration
 └── tests/                 # Pytest tests
     ├── conftest.py
     ├── test_openwrt.py

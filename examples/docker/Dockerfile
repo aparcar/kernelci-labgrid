@@ -28,8 +28,8 @@ COPY pyproject.toml README.md ./
 COPY src/ ./src/
 RUN pip install --no-cache-dir -e .
 
-# Copy scheduler script
-COPY examples/docker/scripts/job_scheduler.py /opt/scripts/job_scheduler.py
+# Copy utility scripts
+COPY examples/docker/scripts/ /opt/scripts/
 
 # Create directories
 RUN mkdir -p /opt/tests /artifacts /var/lib/labgrid /etc/labgrid /opt/scripts

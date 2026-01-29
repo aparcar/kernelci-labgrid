@@ -126,6 +126,30 @@ services:
     command: python /opt/scripts/job_scheduler.py --once
 
   # ==========================================================================
+  # Build Monitor - watches OpenWrt downloads for new builds (Maestro pipeline)
+  # ==========================================================================
+  # Monitors version.buildinfo for changes and creates checkout nodes in KernelCI
+  # when new builds are detected. This integrates with Maestro's event system.
+  build-monitor:
+    build:
+      context: ../..
+      dockerfile: examples/docker/Dockerfile
+    container_name: build-monitor
+    profiles:
+      - pipeline  # Only starts with: docker compose --profile pipeline up
+    environment:
+      - KCI_API_URL=${KCI_API_URL:-https://api.kernelci.org}
+      - KCI_API_TOKEN=${KCI_API_TOKEN:?KCI_API_TOKEN is required}
+      - LAB_NAME=${LAB_NAME:-openwrt-qemu-lab}
+    volumes:
+      - build-state:/var/lib/labgrid
+    command: >
+      python /opt/scripts/build_monitor.py
+        --interval ${BUILD_CHECK_INTERVAL:-60}
+        --state-file /var/lib/labgrid/build_state.json
+    restart: unless-stopped
+
+  # ==========================================================================
   # Optional: OpenWrt image builder (for creating test images)
   # ==========================================================================
   # openwrt-imagebuilder:
@@ -139,6 +163,7 @@ volumes:
   coordinator-data:
   artifacts:
   health-state:
+  build-state:
   # images:
 
 networks:
