@@ -184,6 +184,131 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
+## Health Checks
+
+Similar to LAVA, you can configure periodic health checks to validate your devices are working correctly. Health checks run a golden image at regular intervals and notify maintainers when devices fail.
+
+### Health Check Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        YOUR LAB                                 │
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │              labgrid-health-check                       │  │
+│   │                                                         │  │
+│   │  - Runs every N hours (configurable per device)        │  │
+│   │  - Downloads golden image artifacts                    │  │
+│   │  - Runs health check tests via pytest                  │  │
+│   │  - Tracks device health state (good/bad/unknown)       │  │
+│   │  - Sends email notifications on failure/recovery       │  │
+│   └────────────────────────┬────────────────────────────────┘  │
+│                            │                                    │
+│   ┌────────────────────────┼────────────────────────────────┐  │
+│   │                        ▼                                │  │
+│   │   Device: qemu-x86     Device: rpi4      Device: ...   │  │
+│   │   State: GOOD          State: BAD        State: GOOD   │  │
+│   │   Last: 2h ago         Last: 1h ago      Last: 30m     │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Health Check Configuration
+
+Create YAML files in your health checks directory:
+
+```yaml
+# /etc/labgrid/health_checks/qemu-x86.yaml
+device: qemu-x86
+target: qemu-x86.yaml
+frequency_hours: 24
+
+golden_image:
+  kernel: https://storage.example.com/golden/bzImage
+  rootfs: https://storage.example.com/golden/rootfs.cpio.gz
+
+test_path: tests/health/test_boot.py
+timeout: 600
+
+notifications:
+  emails:
+    - lab-admin@example.com
+  on_failure: true
+  on_recovery: true
+```
+
+### Running the Health Check Scheduler
+
+```bash
+labgrid-health-check \
+    --health-checks-dir /etc/labgrid/health_checks \
+    --targets-dir /opt/openwrt-tests/targets \
+    --tests-dir /opt/openwrt-tests/tests \
+    --state-file /var/lib/labgrid/health_state.json \
+    --smtp-host smtp.example.com \
+    --smtp-from labgrid@example.com
+```
+
+### Health Check Options
+
+| Option | Description |
+|--------|-------------|
+| `--health-checks-dir`, `-c` | Directory with health check YAML configs |
+| `--targets-dir`, `-t` | Directory with labgrid target YAMLs |
+| `--tests-dir`, `-T` | Directory with test files |
+| `--state-file`, `-s` | JSON file to persist health state |
+| `--check-interval`, `-i` | Seconds between scheduler checks (default: 300) |
+| `--smtp-host` | SMTP server for notifications |
+| `--smtp-port` | SMTP port (default: 587) |
+| `--smtp-user` | SMTP username |
+| `--smtp-password` | SMTP password |
+| `--smtp-from` | From address for emails |
+
+### SMTP Environment Variables
+
+```bash
+SMTP_HOST=smtp.example.com
+SMTP_USER=username
+SMTP_PASSWORD=password
+SMTP_FROM=labgrid@example.com
+```
+
+### Device Health States
+
+| State | Description |
+|-------|-------------|
+| `good` | Last health check passed |
+| `bad` | Last health check failed - device is offline |
+| `unknown` | No health check has run yet |
+
+When a device is in `bad` state, the pull agent will skip jobs for that device until an admin manually sets the health to `good` or `unknown`, or the next health check passes.
+
+### Health Check Systemd Service
+
+```ini
+# /etc/systemd/system/labgrid-health-check.service
+[Unit]
+Description=Labgrid Health Check Scheduler
+After=network-online.target
+
+[Service]
+Type=simple
+User=labgrid
+Environment="SMTP_HOST=smtp.example.com"
+Environment="SMTP_FROM=labgrid@example.com"
+ExecStart=/usr/local/bin/labgrid-health-check \
+    --health-checks-dir /etc/labgrid/health_checks \
+    --targets-dir /opt/openwrt-tests/targets \
+    --tests-dir /opt/openwrt-tests/tests \
+    --state-file /var/lib/labgrid/health_state.json
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+```
+
 ## Development
 
 ```bash

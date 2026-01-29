@@ -67,6 +67,13 @@ class LabgridPullAgent:
             targets_dir="/path/to/openwrt-tests/targets",
         )
         await agent.run()
+
+    With health checks:
+        from kernelci_labgrid.scheduler.health_check import HealthCheckScheduler
+
+        health_scheduler = HealthCheckScheduler(...)
+        agent = LabgridPullAgent(..., health_scheduler=health_scheduler)
+        await agent.run()  # Will skip jobs for unhealthy devices
     """
 
     def __init__(
@@ -80,6 +87,7 @@ class LabgridPullAgent:
         poll_interval: int = 30,
         artifact_dir: str | Path | None = None,
         default_timeout: int = 3600,
+        health_scheduler: Any | None = None,
     ):
         """Initialize the pull agent.
 
@@ -92,6 +100,7 @@ class LabgridPullAgent:
             poll_interval: Seconds between API polls
             artifact_dir: Directory for downloaded artifacts
             default_timeout: Default test timeout in seconds
+            health_scheduler: Optional HealthCheckScheduler for device health tracking
         """
         self.api_url = api_url.rstrip("/")
         self.api_token = api_token
@@ -101,6 +110,7 @@ class LabgridPullAgent:
         self.poll_interval = poll_interval
         self.artifact_dir = Path(artifact_dir or tempfile.mkdtemp(prefix="kci-labgrid-"))
         self.default_timeout = default_timeout
+        self.health_scheduler = health_scheduler
 
         self._session: aiohttp.ClientSession | None = None
         self._running = False
@@ -247,24 +257,30 @@ class LabgridPullAgent:
         logger.info(f"Executing: {job_name} ({node_id})")
 
         try:
-            # 1. Download artifacts
-            artifacts = await self._download_artifacts(node_id, job_data)
-
-            # 2. Determine target environment
+            # 1. Determine target environment
             platform = job_data.get("platform", "")
             target_yaml = self._find_target_yaml(platform)
 
             if not target_yaml:
                 raise RuntimeError(f"No target YAML found for platform: {platform}")
 
-            # 3. Run pytest
+            # 2. Check device health (if health scheduler is configured)
+            if self.health_scheduler and not self.health_scheduler.is_device_healthy(platform):
+                health = self.health_scheduler.get_device_health(platform)
+                reason = health.failure_reason if health else "Unknown"
+                raise RuntimeError(f"Device {platform} is unhealthy: {reason}")
+
+            # 3. Download artifacts
+            artifacts = await self._download_artifacts(node_id, job_data)
+
+            # 4. Run pytest
             result = await self._run_pytest(
                 target_yaml=target_yaml,
                 artifacts=artifacts,
                 job_data=job_data,
             )
 
-            # 4. Report results
+            # 5. Report results
             await self._report_results(node_id, result)
 
             logger.info(f"Completed {job_name}: {result.result} "

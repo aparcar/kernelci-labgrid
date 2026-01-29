@@ -1,0 +1,43 @@
+# Health Check Configuration for QEMU x86 device
+#
+# This health check runs every 24 hours using a golden image
+# to verify the device/infrastructure is working correctly.
+#
+# Place this file in your health_checks directory (e.g., /etc/labgrid/health_checks/)
+
+# Device identifier - must match the platform name in KernelCI jobs
+device: qemu-x86
+
+# Labgrid target YAML file (relative to targets_dir)
+target: qemu-x86.yaml
+
+# How often to run health checks (in hours)
+# Similar to LAVA's health_frequency setting
+frequency_hours: 24
+
+# Golden image artifacts for health checks
+# These should be known-good images that reliably boot
+golden_image:
+  kernel: https://storage.kernelci.org/images/golden/x86/bzImage
+  rootfs: https://storage.kernelci.org/images/golden/x86/rootfs.cpio.gz
+
+# Specific test file/directory for health checks (relative to tests_dir)
+# Leave empty to run all tests
+# Recommended: create a minimal boot test specifically for health checks
+test_path: tests/health/test_boot.py
+
+# Test timeout in seconds
+timeout: 600
+
+# Notification settings
+notifications:
+  # Email addresses to notify on failure/recovery
+  emails:
+    - lab-admin@example.com
+    - device-owner@example.com
+
+  # Send notification when health check fails (default: true)
+  on_failure: true
+
+  # Send notification when device recovers (passes after previous failure)
+  on_recovery: true

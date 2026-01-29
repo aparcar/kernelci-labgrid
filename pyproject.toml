@@ -27,6 +27,7 @@ keywords = ["kernelci", "labgrid", "testing", "embedded", "linux"]
 
 dependencies = [
     "aiohttp>=3.9.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +43,7 @@ dev = [
 
 [project.scripts]
 labgrid-pull-agent = "kernelci_labgrid.scheduler.pull_agent:main"
+labgrid-health-check = "kernelci_labgrid.scheduler.health_check:main"
 
 [project.urls]
 Homepage = "https://github.com/kernelci/kernelci-labgrid"
