@@ -1,24 +1,40 @@
 """KernelCI Labgrid Agent.
 
 A single daemon that:
-1. Polls KernelCI API for pending test jobs
-2. Runs periodic health checks on devices (like LAVA)
-3. Downloads kernel/rootfs artifacts
-4. Runs pytest with labgrid (your existing tests)
-5. Reports results back to KernelCI API
+1. Polls the KernelCI (Maestro) API for available test jobs of this lab
+2. Runs periodic health checks on devices (like LAVA, results kept local)
+3. Downloads and verifies the firmware referenced by the job definition
+4. Runs pytest with labgrid (your existing tests, e.g. openwrt-tests)
+5. Uploads logs to kernelci-storage and reports results back to the API
 
-No modifications needed to KernelCI infrastructure.
+Job protocol (see openwrtci/plan.md):
+
+  job node      kind=job, state=available, data.runtime=<lab>,
+                data.platform=<targets/<platform>.yaml>,
+                artifacts.job_definition=<URL of a PULL_LABS-shaped JSON>
+  definition    {"artifacts": {"firmware": URL},
+                 "integrity": {"sha256": {"firmware": HEX}},
+                 "tests": [{"parameters": "tests/", "timeout_s": 1800}]}
+  claim         data.job_id=<lab>:<uuid> (best effort, kernelci-api has no
+                compare-and-set yet)
+  results       PUT /nodes/<job> with the job node + one child per test
+                module + one leaf per test, and a sibling "boot" test node
+                under the build (the dashboard only counts "boot*" as boots)
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import shlex
 import shutil
 import signal
+import socket
 import tempfile
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -30,6 +46,16 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+# openwrt-tests' conftest exits pytest with 3 when the firmware never reaches
+# a shell; 0/1/5 are "ran normally" (all passed, some failed, none collected).
+PYTEST_RC_NO_SHELL = 3
+PYTEST_RC_RAN = (0, 1, 5)
+
+# Dropped when PUTting a node back. Only alias/extra fields: PUT /node does
+# not use exclude_unset, so omitting e.g. created/timeout/retry_counter would
+# reset them to their defaults. Ownership fields are ignored by the API.
+NODE_READ_ONLY_FIELDS = ("_id", "user")
+
 
 # ==================== Data Classes ====================
 
@@ -37,6 +63,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TestResult:
     """Result from pytest execution."""
+
+    __test__ = False  # not a pytest test class
 
     passed: int = 0
     failed: int = 0
@@ -46,6 +74,8 @@ class TestResult:
     duration: float = 0.0
     output: str = ""
     test_cases: list[dict[str, Any]] = field(default_factory=list)
+    returncode: int | None = None
+    outdir: Path | None = None
 
     @property
     def success(self) -> bool:
@@ -60,6 +90,16 @@ class TestResult:
         if self.passed == 0 and self.skipped > 0:
             return "skip"
         return "pass"
+
+    @property
+    def boot_result(self) -> str:
+        """Did the firmware reach a shell? test_shell is the canonical check."""
+        for tc in self.test_cases:
+            if tc["name"] == "test_shell":
+                return {"pass": "pass", "fail": "fail"}.get(tc["result"], "incomplete")
+        if self.returncode == PYTEST_RC_NO_SHELL:
+            return "fail"
+        return "pass" if self.passed else "incomplete"
 
 
 @dataclass
@@ -103,7 +143,7 @@ class HealthCheckConfig:
     target: str  # labgrid target YAML filename
     frequency_hours: int = 24
     golden_image: dict[str, str] = field(default_factory=dict)
-    test_path: str = ""  # specific test file, empty = all tests
+    test_path: str = ""  # pytest selection relative to the tests repo, empty = tests/
     timeout: int = 3600
 
     @classmethod
@@ -130,12 +170,13 @@ class LabgridAgent:
 
     Example:
         agent = LabgridAgent(
-            api_url="https://api.kernelci.org",
+            api_url="http://localhost:8001/latest",
             api_token="your-token",
-            lab_name="my-lab",
+            lab_name="openwrt-local",
             tests_dir="/path/to/openwrt-tests/tests",
-            targets_dir="/path/to/openwrt-tests/targets",
-            health_checks_dir="/etc/labgrid/health_checks",  # optional
+            storage_url="http://localhost:3000",
+            storage_token="storage-jwt",
+            platforms=["qemu_armsr-armv8"],
         )
         await agent.run()
     """
@@ -148,6 +189,10 @@ class LabgridAgent:
         tests_dir: str | Path,
         targets_dir: str | Path | None = None,
         *,
+        storage_url: str | None = None,
+        storage_token: str | None = None,
+        platforms: list[str] | None = None,
+        pytest_command: str = "uv run pytest",
         poll_interval: int = 30,
         artifact_dir: str | Path | None = None,
         default_timeout: int = 3600,
@@ -158,11 +203,17 @@ class LabgridAgent:
         """Initialize the agent.
 
         Args:
-            api_url: KernelCI API URL
-            api_token: API authentication token
-            lab_name: Name of this lab (for job filtering)
-            tests_dir: Path to test directory (e.g., openwrt-tests/tests)
+            api_url: KernelCI API URL including the version, e.g. .../latest
+            api_token: API token of the lab user (runtime:<lab>:node-editor)
+            lab_name: Name of this lab, matched against the job's data.runtime
+            tests_dir: Path to test directory (e.g., openwrt-tests/tests);
+                its parent is the repo pytest runs in
             targets_dir: Path to labgrid target YAMLs (e.g., openwrt-tests/targets)
+            storage_url: kernelci-storage URL for log uploads (optional)
+            storage_token: kernelci-storage JWT with upload rights below
+                logs/<lab_name>/
+            platforms: Platforms this lab serves; default: every target YAML
+            pytest_command: Command used to run pytest inside the tests repo
             poll_interval: Seconds between API polls
             artifact_dir: Directory for downloaded artifacts
             default_timeout: Default test timeout in seconds
@@ -173,10 +224,16 @@ class LabgridAgent:
         self.api_token = api_token
         self.lab_name = lab_name
         self.tests_dir = Path(tests_dir)
-        self.targets_dir = Path(targets_dir) if targets_dir else self.tests_dir.parent / "targets"
+        self.tests_repo = self.tests_dir.parent
+        self.targets_dir = Path(targets_dir) if targets_dir else self.tests_repo / "targets"
+        self.storage_url = storage_url.rstrip("/") if storage_url else None
+        self.storage_token = storage_token
+        self.platforms = list(platforms or [])
+        self.pytest_command = shlex.split(pytest_command)
         self.poll_interval = poll_interval
         self.artifact_dir = Path(artifact_dir or tempfile.mkdtemp(prefix="kci-labgrid-"))
         self.default_timeout = default_timeout
+        self.worker_id = f"{lab_name}@{socket.gethostname()}"
 
         # Health check configuration
         self.health_checks_dir = Path(health_checks_dir) if health_checks_dir else None
@@ -186,6 +243,7 @@ class LabgridAgent:
         self._session: aiohttp.ClientSession | None = None
         self._running = False
         self._current_jobs: set[str] = set()
+        self._busy_platforms: set[str] = set()
         self._health_configs: dict[str, HealthCheckConfig] = {}
         self._device_health: dict[str, DeviceHealth] = {}
 
@@ -204,18 +262,17 @@ class LabgridAgent:
 
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
 
+        if not self.platforms:
+            self.platforms = sorted(p.stem for p in self.targets_dir.glob("*.yaml"))
+        logger.info(f"Platforms: {', '.join(self.platforms)}")
+
         # Load health check configs if directory provided
         if self.health_checks_dir:
             self._load_health_configs()
             self._load_health_state()
             logger.info(f"Health checks enabled: {len(self._health_configs)} device(s)")
 
-        self._session = aiohttp.ClientSession(
-            headers={
-                "Authorization": f"Bearer {self.api_token}",
-                "Content-Type": "application/json",
-            }
-        )
+        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600))
 
         self._running = True
         logger.info("Agent started")
@@ -242,8 +299,11 @@ class LabgridAgent:
 
         logger.info("Agent stopped")
 
-    async def run(self) -> None:
-        """Main loop - poll for jobs and run health checks."""
+    async def run(self, once: bool = False) -> None:
+        """Main loop - poll for jobs and run health checks.
+
+        With once=True, do a single round and wait for started jobs.
+        """
         if not self._running:
             await self.start()
 
@@ -260,9 +320,17 @@ class LabgridAgent:
             except Exception as e:
                 logger.exception(f"Loop error: {e}")
 
+            if once:
+                while self._current_jobs:
+                    await asyncio.sleep(1)
+                break
+
             await asyncio.sleep(self.poll_interval)
 
     # ==================== Health Check Methods ====================
+    #
+    # Health results are kept local for now: they only gate job execution
+    # and are persisted to health_state_file, not published to the API.
 
     def _load_health_configs(self) -> None:
         """Load health check configurations from directory."""
@@ -334,27 +402,31 @@ class LabgridAgent:
     async def _run_health_check(self, device: str, config: HealthCheckConfig) -> None:
         """Run a health check for a device."""
         health = self._device_health.get(device, DeviceHealth(device=device))
+        workdir = self.artifact_dir / f"health-{device}"
 
         try:
-            # Download golden image artifacts
-            artifacts = await self._download_health_artifacts(device, config)
-
-            # Find target YAML
             target_yaml = self.targets_dir / config.target
             if not target_yaml.exists():
                 raise RuntimeError(f"Target not found: {target_yaml}")
 
-            # Run pytest
+            firmware = await self._fetch_firmware(
+                config.golden_image["firmware"],
+                config.golden_image.get("sha256"),
+                self.artifact_dir / "firmware",
+            )
+
             result = await self._run_pytest(
                 target_yaml=target_yaml,
-                artifacts=artifacts,
-                job_data={"test_path": config.test_path, "timeout": config.timeout},
+                firmware=firmware,
+                pytest_args=config.test_path or "tests/",
+                timeout=config.timeout,
+                outdir=workdir,
             )
 
             # Update health state
             health.last_check = datetime.now()
 
-            if result.success:
+            if result.success and result.returncode in PYTEST_RC_RAN:
                 health.state = "good"
                 health.last_success = datetime.now()
                 health.failure_count = 0
@@ -363,7 +435,7 @@ class LabgridAgent:
             else:
                 health.state = "bad"
                 health.failure_count += 1
-                health.failure_reason = result.output[:500] if result.output else "Test failed"
+                health.failure_reason = result.output[-500:] if result.output else "Test failed"
                 logger.warning(f"Health check FAILED for {device}: {health.failure_reason}")
 
         except Exception as e:
@@ -375,35 +447,6 @@ class LabgridAgent:
 
         self._device_health[device] = health
         self._save_health_state()
-
-    async def _download_health_artifacts(
-        self, device: str, config: HealthCheckConfig
-    ) -> dict[str, Path]:
-        """Download golden image artifacts for health check."""
-        artifacts: dict[str, Path] = {}
-        device_dir = self.artifact_dir / f"health-{device}"
-        device_dir.mkdir(exist_ok=True)
-
-        if not self._session or not config.golden_image:
-            return artifacts
-
-        for name, url in config.golden_image.items():
-            if not url:
-                continue
-
-            local_path = device_dir / name
-            logger.debug(f"Downloading golden {name} for {device}...")
-
-            try:
-                async with self._session.get(url) as resp:
-                    if resp.status == 200:
-                        content = await resp.read()
-                        local_path.write_bytes(content)
-                        artifacts[name] = local_path
-            except Exception as e:
-                logger.error(f"Failed to download {name}: {e}")
-
-        return artifacts
 
     def is_device_healthy(self, device: str) -> bool:
         """Check if a device is healthy (good or unknown state)."""
@@ -418,166 +461,247 @@ class LabgridAgent:
 
     # ==================== API Methods ====================
 
-    async def _api_get(self, endpoint: str, **params: Any) -> dict[str, Any]:
+    @property
+    def _auth(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_token}"}
+
+    async def _api_request(self, method: str, endpoint: str, **kwargs: Any) -> Any:
+        """Request to the KernelCI API; raises with the API's error detail."""
+        if not self._session:
+            raise RuntimeError("Session not initialized")
+
+        url = f"{self.api_url}{endpoint}"
+        async with self._session.request(method, url, headers=self._auth, **kwargs) as resp:
+            if resp.status not in (200, 201):
+                raise RuntimeError(f"API {method} {endpoint}: {resp.status} {await resp.text()}")
+            return await resp.json()
+
+    async def _api_get(self, endpoint: str, **params: Any) -> Any:
         """GET request to KernelCI API."""
-        if not self._session:
-            raise RuntimeError("Session not initialized")
+        return await self._api_request("GET", endpoint, params=params)
 
-        url = f"{self.api_url}{endpoint}"
-        async with self._session.get(url, params=params) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"API error: {resp.status}")
-            return await resp.json()
-
-    async def _api_put(self, endpoint: str, data: dict[str, Any]) -> dict[str, Any]:
+    async def _api_put(self, endpoint: str, data: dict[str, Any]) -> Any:
         """PUT request to KernelCI API."""
-        if not self._session:
-            raise RuntimeError("Session not initialized")
+        return await self._api_request("PUT", endpoint, json=data)
 
-        url = f"{self.api_url}{endpoint}"
-        async with self._session.put(url, json=data) as resp:
-            if resp.status not in (200, 201):
-                raise RuntimeError(f"API error: {resp.status}")
-            return await resp.json()
-
-    async def _api_post(self, endpoint: str, data: dict[str, Any]) -> dict[str, Any]:
+    async def _api_post(self, endpoint: str, data: dict[str, Any]) -> Any:
         """POST request to KernelCI API."""
-        if not self._session:
-            raise RuntimeError("Session not initialized")
+        return await self._api_request("POST", endpoint, json=data)
 
-        url = f"{self.api_url}{endpoint}"
-        async with self._session.post(url, json=data) as resp:
-            if resp.status not in (200, 201):
-                raise RuntimeError(f"API error: {resp.status}")
-            return await resp.json()
+    @staticmethod
+    def _writable(node: dict[str, Any]) -> dict[str, Any]:
+        """Strip alias/extra fields before PUTting a node back."""
+        return {k: v for k, v in node.items() if k not in NODE_READ_ONLY_FIELDS}
 
     # ==================== Job Processing ====================
 
     async def _poll_and_execute(self) -> None:
-        """Poll for pending jobs and execute them."""
-        try:
-            # Query for pending jobs for this lab
-            response = await self._api_get(
-                "/api/latest/nodes",
-                state="pending",
-                **{"data.lab": self.lab_name},
-            )
-            pending = response.get("nodes", [])
-        except Exception as e:
-            logger.error(f"Failed to get jobs: {e}")
-            return
-
-        if not pending:
-            logger.debug("No pending jobs")
-            return
-
-        logger.info(f"Found {len(pending)} pending job(s)")
-
-        for job in pending:
-            node_id = job.get("id")
-            if not node_id or node_id in self._current_jobs:
+        """Poll for available jobs of our platforms and execute them."""
+        for platform in self.platforms:
+            if platform in self._busy_platforms:
                 continue
 
-            # Claim the job
+            if not self.is_device_healthy(platform):
+                # Leave the job for another lab; the pipeline's timeout
+                # service closes it if nobody picks it up.
+                logger.debug(f"Skipping {platform}: device unhealthy")
+                continue
+
             try:
-                await self._api_put(
-                    f"/api/latest/nodes/{node_id}",
-                    {"state": "running"},
+                response = await self._api_get(
+                    "/nodes",
+                    kind="job",
+                    state="available",
+                    limit=10,
+                    **{"data.runtime": self.lab_name, "data.platform": platform},
                 )
-                self._current_jobs.add(node_id)
-                asyncio.create_task(self._execute_job(job))
             except Exception as e:
-                logger.warning(f"Failed to claim job {node_id}: {e}")
+                logger.error(f"Failed to get jobs for {platform}: {e}")
+                continue
+
+            for job in response.get("items", []):
+                node_id = job.get("id")
+                if not node_id or node_id in self._current_jobs:
+                    continue
+
+                claimed = await self._claim(job)
+                if not claimed:
+                    continue
+
+                self._current_jobs.add(node_id)
+                self._busy_platforms.add(platform)
+                asyncio.create_task(self._execute_job(claimed))
+                break  # one job per platform at a time
+
+    async def _claim(self, job: dict[str, Any]) -> dict[str, Any] | None:
+        """Claim a job by writing data.job_id.
+
+        Best effort, like kernelci/pullab_cloud: kernelci-api has no
+        compare-and-set yet, so two agents serving the same platform can still
+        race. Replace with the atomic claim endpoint (plan.md, phase 2).
+        """
+        node_id = job["id"]
+        try:
+            current = await self._api_get(f"/node/{node_id}")
+        except Exception as e:
+            logger.warning(f"Could not re-read job {node_id}: {e}")
+            return None
+
+        if current.get("state") != "available":
+            return None
+        if current.get("data", {}).get("job_id"):
+            logger.debug(f"Job {node_id} already claimed: {current['data']['job_id']}")
+            return None
+
+        current.setdefault("data", {})["job_id"] = f"{self.lab_name}:{uuid.uuid4().hex}"
+        current["data"]["worker"] = self.worker_id
+        try:
+            claimed = await self._api_put(f"/node/{node_id}", self._writable(current))
+        except Exception as e:
+            logger.warning(f"Failed to claim job {node_id}: {e}")
+            return None
+
+        logger.info(f"Claimed {current.get('name')} ({node_id}) for {current['data'].get('platform')}")
+        return claimed
 
     async def _execute_job(self, job: dict[str, Any]) -> None:
         """Execute a test job."""
         node_id = job["id"]
         job_name = job.get("name", "unknown")
-        job_data = job.get("data", {})
+        platform = job.get("data", {}).get("platform", "")
+        outdir = self.artifact_dir / node_id
 
-        logger.info(f"Executing: {job_name} ({node_id})")
+        logger.info(f"Executing: {job_name} ({node_id}) on {platform}")
 
         try:
-            # 1. Determine target environment
-            platform = job_data.get("platform", "")
             target_yaml = self._find_target_yaml(platform)
-
             if not target_yaml:
                 raise RuntimeError(f"No target YAML found for platform: {platform}")
 
-            # 2. Check device health
-            if not self.is_device_healthy(platform):
-                health = self.get_device_health(platform)
-                reason = health.failure_reason if health else "Unknown"
-                raise RuntimeError(f"Device {platform} is unhealthy: {reason}")
-
-            # 3. Download artifacts
-            artifacts = await self._download_artifacts(node_id, job_data)
-
-            # 4. Run pytest
-            result = await self._run_pytest(
-                target_yaml=target_yaml,
-                artifacts=artifacts,
-                job_data=job_data,
+            job_def = await self._fetch_json(job["artifacts"]["job_definition"])
+            test = (job_def.get("tests") or [{}])[0]
+            firmware = await self._fetch_firmware(
+                job_def["artifacts"]["firmware"],
+                job_def.get("integrity", {}).get("sha256", {}).get("firmware"),
+                self.artifact_dir / "firmware",
             )
 
-            # 5. Report results
-            await self._report_results(node_id, result)
+            result = await self._run_pytest(
+                target_yaml=target_yaml,
+                firmware=firmware,
+                pytest_args=test.get("parameters", "tests/"),
+                timeout=test.get("timeout_s", self.default_timeout),
+                outdir=outdir,
+            )
 
-            logger.info(f"Completed {job_name}: {result.result} "
-                       f"({result.passed} passed, {result.failed} failed)")
+            await self._report_results(job, result)
+
+            logger.info(f"Completed {job_name}: {self._job_result(result)} "
+                        f"({result.passed} passed, {result.failed} failed, "
+                        f"{result.skipped} skipped)")
 
         except Exception as e:
             logger.exception(f"Job failed: {job_name}")
-            await self._report_failure(node_id, str(e))
+            await self._report_failure(job, str(e), outdir)
 
         finally:
             self._current_jobs.discard(node_id)
-            self._cleanup_artifacts(node_id)
+            self._busy_platforms.discard(platform)
 
     # ==================== Artifact Management ====================
 
-    async def _download_artifacts(
-        self,
-        node_id: str,
-        job_data: dict[str, Any],
-    ) -> dict[str, Path]:
-        """Download job artifacts."""
-        artifacts = job_data.get("artifacts", {})
-        local: dict[str, Path] = {}
-
-        job_dir = self.artifact_dir / node_id
-        job_dir.mkdir(exist_ok=True)
-
+    async def _fetch_json(self, url: str) -> dict[str, Any]:
         if not self._session:
-            return local
+            raise RuntimeError("Session not initialized")
+        async with self._session.get(url) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"GET {url}: HTTP {resp.status}")
+            return await resp.json(content_type=None)
 
-        for name, url in artifacts.items():
-            if not url:
+    async def _fetch_firmware(self, url: str, sha256: str | None, dest_dir: Path) -> Path:
+        """Download firmware (cached by name), verify sha256, gunzip .gz."""
+        if not self._session:
+            raise RuntimeError("Session not initialized")
+
+        # Keyed by checksum: main snapshot images have the same file name for
+        # every build, a name-only cache would serve a stale image.
+        dest_dir = dest_dir / (sha256[:16] if sha256 else "unverified")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        path = dest_dir / url.rsplit("/", 1)[-1]
+
+        if not path.exists():
+            logger.info(f"Downloading {url}")
+            tmp = path.with_suffix(path.suffix + ".part")
+            async with self._session.get(url) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"GET {url}: HTTP {resp.status}")
+                with tmp.open("wb") as f:
+                    async for chunk in resp.content.iter_chunked(1 << 20):
+                        f.write(chunk)
+            tmp.rename(path)
+
+        if sha256:
+            digest = await asyncio.to_thread(self._sha256, path)
+            if digest != sha256:
+                path.unlink()
+                raise RuntimeError(f"sha256 mismatch for {path.name}: {digest}")
+
+        if path.suffix == ".gz":
+            unpacked = path.with_suffix("")
+            if not unpacked.exists():
+                # OpenWrt images carry trailing metadata that Python's gzip
+                # rejects; gzip(1) warns about it and still unpacks.
+                proc = await asyncio.create_subprocess_exec(
+                    "gzip", "-dkf", str(path),
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+                if not unpacked.exists():
+                    raise RuntimeError(f"Failed to unpack {path.name}")
+            path = unpacked
+
+        return path
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    async def _upload_logs(self, node_id: str, outdir: Path) -> dict[str, str]:
+        """Upload console log, pytest log and JUnit XML to kernelci-storage."""
+        artifacts: dict[str, str] = {}
+        if not (self.storage_url and self.storage_token and self._session):
+            return artifacts
+
+        uploads = [(p, "test_log") for p in sorted(outdir.glob("console_*"))[:1]]
+        uploads += [(outdir / "pytest.log", "pytest_log"), (outdir / "results.xml", "junit")]
+        dest = f"logs/{self.lab_name}/{node_id}"
+
+        for path, key in uploads:
+            if not path.exists():
                 continue
-
-            local_path = job_dir / name
-            logger.info(f"Downloading {name}...")
-
+            form = aiohttp.FormData()
+            form.add_field("path", dest)
+            form.add_field("file0", path.read_bytes(), filename=path.name)
             try:
-                async with self._session.get(url) as resp:
-                    if resp.status == 200:
-                        content = await resp.read()
-                        local_path.write_bytes(content)
-                        local[name] = local_path
-                        logger.info(f"  {name}: {len(content)} bytes")
-                    else:
-                        logger.warning(f"  {name}: HTTP {resp.status}")
+                async with self._session.post(
+                    f"{self.storage_url}/v1/file",
+                    data=form,
+                    headers={"Authorization": f"Bearer {self.storage_token}"},
+                ) as resp:
+                    if resp.status not in (200, 201):
+                        raise RuntimeError(f"HTTP {resp.status} {await resp.text()}")
+                artifacts[key] = f"{self.storage_url}/{dest}/{path.name}"
             except Exception as e:
-                logger.error(f"  {name}: {e}")
+                logger.error(f"Failed to upload {path.name}: {e}")
 
-        return local
-
-    def _cleanup_artifacts(self, node_id: str) -> None:
-        """Clean up downloaded artifacts."""
-        job_dir = self.artifact_dir / node_id
-        if job_dir.exists():
-            shutil.rmtree(job_dir, ignore_errors=True)
+        # KCIDB takes the log excerpt from test_log; fall back to pytest output
+        if "test_log" not in artifacts and "pytest_log" in artifacts:
+            artifacts["test_log"] = artifacts["pytest_log"]
+        return artifacts
 
     # ==================== Test Execution ====================
 
@@ -605,73 +729,62 @@ class LabgridAgent:
     async def _run_pytest(
         self,
         target_yaml: Path,
-        artifacts: dict[str, Path],
-        job_data: dict[str, Any],
+        firmware: Path,
+        pytest_args: str,
+        timeout: int,
+        outdir: Path,
     ) -> TestResult:
-        """Run pytest with labgrid environment, output JUnit XML."""
-        timeout = job_data.get("timeout", self.default_timeout)
-        test_path = job_data.get("test_path", "")
+        """Run pytest with the labgrid environment in the tests repo."""
+        outdir.mkdir(parents=True, exist_ok=True)
+        junit_xml = outdir / "results.xml"
+        pytest_log = outdir / "pytest.log"
 
-        # Create temp file for JUnit XML output
-        junit_xml = self.artifact_dir / f"junit-{os.getpid()}.xml"
-
-        # Build pytest command
         cmd = [
-            "pytest",
+            *self.pytest_command,
+            *shlex.split(pytest_args),
             "--lg-env", str(target_yaml),
+            "--firmware", str(firmware),
+            f"--lg-log={outdir}",
+            f"--junit-xml={junit_xml}",
+            "--log-cli-level=CONSOLE",
             "--tb=short",
             "-v",
-            f"--junit-xml={junit_xml}",
+            "-p", "no:cacheprovider",
         ]
 
-        # Add artifact paths as environment variables
         env = os.environ.copy()
-        if "kernel" in artifacts:
-            env["LG_KERNEL"] = str(artifacts["kernel"])
-        if "rootfs" in artifacts:
-            env["LG_ROOTFS"] = str(artifacts["rootfs"])
-        if "dtb" in artifacts:
-            env["LG_DTB"] = str(artifacts["dtb"])
+        env["LG_IMAGE"] = str(firmware)
 
-        # Test path
-        if test_path:
-            cmd.append(str(self.tests_dir / test_path))
-        else:
-            cmd.append(str(self.tests_dir))
+        logger.info(f"Running: {shlex.join(cmd)}")
 
-        logger.info(f"Running: {' '.join(cmd)}")
-
-        # Run pytest
+        returncode: int | None = None
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=self.tests_dir.parent,
-                env=env,
-            )
-
-            try:
-                stdout, _ = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=timeout,
+            with pytest_log.open("wb") as log:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=log,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=self.tests_repo,
+                    env=env,
                 )
-                output = stdout.decode() if stdout else ""
-            except asyncio.TimeoutError:
-                proc.kill()
-                return TestResult(errors=1, output="Test timed out")
-
+                try:
+                    returncode = await asyncio.wait_for(proc.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    log.write(f"\nlabgrid-agent: timed out after {timeout}s\n".encode())
         except Exception as e:
-            return TestResult(errors=1, output=str(e))
+            return TestResult(errors=1, output=str(e), outdir=outdir)
 
-        # Parse JUnit XML results
+        output = pytest_log.read_text(errors="replace")
+        if returncode is None:
+            return TestResult(errors=1, output=output, outdir=outdir)
+
         result = self._parse_junit_xml(junit_xml)
         result.output = output
-
-        # Cleanup
-        if junit_xml.exists():
-            junit_xml.unlink()
-
+        result.returncode = returncode
+        result.outdir = outdir
+        logger.info(f"pytest exited with {returncode}")
         return result
 
     def _parse_junit_xml(self, junit_xml: Path) -> TestResult:
@@ -723,6 +836,7 @@ class LabgridAgent:
                     result.test_cases.append({
                         "name": name,
                         "classname": classname,
+                        "module": self._module_name(classname),
                         "result": tc_result,
                         "duration": duration,
                         "message": message,
@@ -736,60 +850,132 @@ class LabgridAgent:
 
         return result
 
+    @staticmethod
+    def _module_name(classname: str) -> str:
+        """'tests.test_base' / 'tests.test_wifi.TestAp' -> 'base' / 'wifi'."""
+        parts = [p for p in classname.split(".") if p]
+        if not parts:
+            return "tests"
+        module = parts[1] if parts[0] == "tests" and len(parts) > 1 else parts[0]
+        return module.removeprefix("test_") or module
+
     # ==================== Result Reporting ====================
 
-    async def _report_results(self, node_id: str, result: TestResult) -> None:
-        """Report test results to KernelCI API."""
+    @staticmethod
+    def _job_result(result: TestResult) -> str:
+        if result.returncode == PYTEST_RC_NO_SHELL:
+            return "fail"
+        if result.returncode not in PYTEST_RC_RAN:
+            return "incomplete"
+        if result.total == 0:
+            return "incomplete"
+        return "fail" if result.failed or result.errors else result.result
+
+    def _build_hierarchy(self, job: dict[str, Any], result: TestResult,
+                         artifacts: dict[str, str]) -> dict[str, Any]:
+        """Job node + one child per test module + one leaf per test."""
+        job_path = job["path"]
+        node_data = self._node_data(job)
+
+        modules: dict[str, list[dict[str, Any]]] = {}
         for tc in result.test_cases:
-            tc_data: dict[str, Any] = {"duration": tc.get("duration", 0)}
+            modules.setdefault(tc["module"], []).append(tc)
 
-            if tc.get("message"):
-                tc_data["error_msg"] = tc["message"]
-            if tc.get("classname"):
-                tc_data["classname"] = tc["classname"]
-
-            try:
-                await self._api_post(
-                    "/api/latest/nodes",
-                    {
-                        "name": tc["name"],
-                        "parent": node_id,
-                        "kind": "test_case",
-                        "state": "done",
-                        "result": self._map_outcome(tc.get("result", "")),
-                        "data": tc_data,
-                    },
-                )
-            except Exception as e:
-                logger.warning(f"Failed to create test case node: {e}")
-
-        await self._api_put(
-            f"/api/latest/nodes/{node_id}",
-            {
-                "state": "done",
-                "result": result.result,
-                "data": {
-                    "passed": result.passed,
-                    "failed": result.failed,
-                    "skipped": result.skipped,
-                    "errors": result.errors,
-                    "total": result.total,
-                    "duration": result.duration,
-                },
-            },
-        )
-
-    async def _report_failure(self, node_id: str, error: str) -> None:
-        """Report job failure."""
-        try:
-            await self._api_put(
-                f"/api/latest/nodes/{node_id}",
-                {
+        children = []
+        for module, cases in modules.items():
+            leaves = []
+            for tc in cases:
+                data: dict[str, Any] = {**node_data, "duration_ms": int(tc["duration"] * 1000)}
+                if tc.get("message"):
+                    data["error_msg"] = tc["message"][:1000]
+                leaves.append({"node": {
+                    "name": tc["name"],
+                    "kind": "test",
+                    "path": job_path + [module, tc["name"]],
                     "state": "done",
-                    "result": "incomplete",
-                    "data": {"error": error},
-                },
-            )
+                    "result": self._map_outcome(tc["result"]),
+                    "data": data,
+                }, "child_nodes": []})
+            children.append({"node": {
+                "name": module,
+                "kind": "test",
+                "path": job_path + [module],
+                "state": "done",
+                "result": self._aggregate([leaf["node"]["result"] for leaf in leaves]),
+                "data": dict(node_data),
+            }, "child_nodes": leaves})
+
+        node = self._writable(job)
+        node["state"] = "done"
+        node["result"] = self._job_result(result)
+        node["artifacts"] = {**(job.get("artifacts") or {}), **artifacts}
+        node["data"] = {**(job.get("data") or {}), **node_data,
+                        "duration_ms": int(result.duration * 1000)}
+        if result.returncode == PYTEST_RC_NO_SHELL:
+            node["data"]["error_msg"] = "firmware did not reach a shell"
+        elif node["result"] == "incomplete":
+            node["data"]["error_code"] = "Infrastructure"
+            node["data"]["error_msg"] = (f"pytest exited with {result.returncode}"
+                                         if result.returncode is not None
+                                         else "pytest did not finish")
+        return {"node": node, "child_nodes": children}
+
+    def _node_data(self, job: dict[str, Any]) -> dict[str, Any]:
+        data = job.get("data") or {}
+        platform = data.get("platform")
+        return {
+            "runtime": self.lab_name,
+            "platform": platform,
+            "arch": data.get("arch"),
+            "device": f"{self.lab_name}-{platform}",
+        }
+
+    @staticmethod
+    def _aggregate(results: list[str]) -> str:
+        if "fail" in results:
+            return "fail"
+        if "incomplete" in results:
+            return "incomplete"
+        if "pass" in results:
+            return "pass"
+        return "skip" if results else "incomplete"
+
+    async def _report_results(self, job: dict[str, Any], result: TestResult) -> None:
+        """Report test results to the KernelCI API."""
+        node_id = job["id"]
+        artifacts = await self._upload_logs(node_id, result.outdir) if result.outdir else {}
+
+        hierarchy = self._build_hierarchy(job, result, artifacts)
+        await self._api_put(f"/nodes/{node_id}", hierarchy)
+
+        # Sibling "boot" node under the build: the dashboard counts only
+        # KCIDB paths "boot"/"boot.*" as boots.
+        if job.get("parent") and result.returncode is not None:
+            boot_artifacts = {k: v for k, v in artifacts.items() if k == "test_log"}
+            await self._api_post("/node", {
+                "kind": "test",
+                "name": "boot",
+                "path": job["path"][:-1] + ["boot"],
+                "parent": job["parent"],
+                "state": "done",
+                "result": result.boot_result,
+                "artifacts": boot_artifacts,
+                "data": self._node_data(job),
+            })
+
+    async def _report_failure(self, job: dict[str, Any], error: str,
+                              outdir: Path | None = None) -> None:
+        """Report an infrastructure failure (tests never ran or crashed)."""
+        node_id = job["id"]
+        try:
+            artifacts = await self._upload_logs(node_id, outdir) if outdir and outdir.exists() else {}
+            current = await self._api_get(f"/node/{node_id}")
+            current["state"] = "done"
+            current["result"] = "incomplete"
+            current["artifacts"] = {**(current.get("artifacts") or {}), **artifacts}
+            current["data"] = {**(current.get("data") or {}), **self._node_data(job),
+                               "error_code": "Infrastructure", "error_msg": error[:1000]}
+            await self._api_put(f"/node/{node_id}", self._writable(current))
         except Exception as e:
             logger.error(f"Failed to report failure: {e}")
 
@@ -821,89 +1007,86 @@ def main() -> None:
     """CLI entry point."""
     import argparse
 
+    from kernelci_labgrid.config import describe, find_config, resolve_settings
+
     parser = argparse.ArgumentParser(
-        description="KernelCI Labgrid Agent - polls for jobs & runs health checks"
+        description="KernelCI Labgrid Agent - polls for jobs & runs health checks",
+        epilog="Settings come from (later wins): a TOML config file, --env-file, "
+               "environment variables (LAB_NAME, KCI_API_URL, LAB_API_TOKEN, "
+               "KCI_STORAGE_URL, LAB_STORAGE_TOKEN) and these options. The config "
+               "file is --config, $LABGRID_AGENT_CONFIG, ./labgrid-agent.toml, "
+               "~/.config/labgrid-agent/config.toml or /etc/labgrid-agent/config.toml.",
     )
+    parser.add_argument("--config", help="TOML config file (see above)")
+    parser.add_argument("--env-file", help="KEY=VALUE file with the variables above")
+    parser.add_argument("--show-config", action="store_true",
+                        help="Print the effective settings (secrets masked) and exit")
 
-    # Required arguments
-    parser.add_argument(
-        "--lab-name", "-l",
-        required=True,
-        help="Lab name for job filtering",
-    )
-    parser.add_argument(
-        "--tests-dir", "-t",
-        required=True,
-        help="Path to tests directory (e.g., openwrt-tests/tests)",
-    )
-
-    # KernelCI API
-    parser.add_argument(
-        "--api-url",
-        default=os.environ.get("KCI_API_URL", "https://api.kernelci.org"),
-        help="KernelCI API URL",
-    )
-    parser.add_argument(
-        "--api-token",
-        default=os.environ.get("KCI_API_TOKEN"),
-        help="KernelCI API token (or KCI_API_TOKEN env)",
-    )
-
-    # Directories
-    parser.add_argument(
-        "--targets-dir",
-        help="Path to labgrid targets (default: tests_dir/../targets)",
-    )
-    parser.add_argument(
-        "--artifact-dir", "-a",
-        help="Directory for artifacts",
-    )
-
-    # Polling
-    parser.add_argument(
-        "--poll-interval", "-p",
-        type=int,
-        default=30,
-        help="Poll interval in seconds (default: 30)",
-    )
-
-    # Health checks
-    parser.add_argument(
-        "--health-checks-dir", "-c",
-        help="Directory with health check YAML configs (enables health checks)",
-    )
-    parser.add_argument(
-        "--health-state-file", "-s",
-        help="JSON file to persist device health state",
-    )
-
-    # Debug
-    parser.add_argument(
-        "--debug", "-d",
-        action="store_true",
-        help="Debug logging",
-    )
+    # All defaults are None: unset options don't override other sources
+    parser.add_argument("--lab-name", "-l", help="Lab name, matched against the job's data.runtime")
+    parser.add_argument("--tests-dir", "-t", help="Tests directory (e.g. openwrt-tests/tests)")
+    parser.add_argument("--targets-dir", help="labgrid targets (default: tests_dir/../targets)")
+    parser.add_argument("--api-url", help="KernelCI API URL including version")
+    parser.add_argument("--api-token", help="Lab API token")
+    parser.add_argument("--storage-url", help="kernelci-storage URL for log uploads")
+    parser.add_argument("--storage-token", help="kernelci-storage JWT")
+    parser.add_argument("--platform", dest="platforms", action="append",
+                        help="Platform served by this lab (targets/<name>.yaml); repeatable")
+    parser.add_argument("--pytest-command", help="Command to run pytest in the tests repo "
+                                                 "(default: 'uv run pytest')")
+    parser.add_argument("--artifact-dir", "-a", help="Directory for firmware and job outputs")
+    parser.add_argument("--poll-interval", "-p", type=int, help="Seconds between polls (default: 30)")
+    parser.add_argument("--once", action="store_true", help="Poll once, wait for started jobs, exit")
+    parser.add_argument("--health-checks-dir", "-c",
+                        help="Directory with health check YAML configs (enables health checks)")
+    parser.add_argument("--health-state-file", "-s", help="JSON file to persist device health state")
+    parser.add_argument("--debug", "-d", action="store_true", help="Debug logging")
 
     args = parser.parse_args()
+    meta = {"config", "env_file", "show_config", "once", "debug"}
+    cli = {k: v for k, v in vars(args).items() if k not in meta}
 
-    if not args.api_token:
-        parser.error("API token required (--api-token or KCI_API_TOKEN)")
+    config_path = find_config(args.config)
+    try:
+        settings = resolve_settings(
+            cli, config_path=config_path,
+            env_file=Path(args.env_file) if args.env_file else None,
+        )
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+
+    if args.show_config:
+        print(f"# config file: {config_path or '-'}")
+        print(describe(settings))
+        return
+
+    for key, hint in (("lab_name", "--lab-name / lab_name"),
+                      ("api_token", "--api-token / [api] token"),
+                      ("tests_dir", "--tests-dir / tests_dir")):
+        if not settings[key]:
+            parser.error(f"{key} required ({hint})")
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if config_path:
+        logger.info(f"Config file: {config_path}")
 
     agent = LabgridAgent(
-        api_url=args.api_url,
-        api_token=args.api_token,
-        lab_name=args.lab_name,
-        tests_dir=args.tests_dir,
-        targets_dir=args.targets_dir,
-        poll_interval=args.poll_interval,
-        artifact_dir=args.artifact_dir,
-        health_checks_dir=args.health_checks_dir,
-        health_state_file=args.health_state_file,
+        api_url=settings["api_url"],
+        api_token=settings["api_token"],
+        lab_name=settings["lab_name"],
+        tests_dir=Path(settings["tests_dir"]).resolve(),
+        targets_dir=settings["targets_dir"],
+        storage_url=settings["storage_url"],
+        storage_token=settings["storage_token"],
+        platforms=settings["platforms"],
+        pytest_command=settings["pytest_command"],
+        poll_interval=int(settings["poll_interval"]),
+        artifact_dir=settings["artifact_dir"],
+        health_checks_dir=settings["health_checks_dir"],
+        health_state_file=settings["health_state_file"],
     )
 
     # Signal handling
@@ -912,7 +1095,8 @@ def main() -> None:
         loop.add_signal_handler(sig, lambda: asyncio.create_task(agent.stop()))
 
     try:
-        loop.run_until_complete(agent.run())
+        loop.run_until_complete(agent.run(once=args.once))
+        loop.run_until_complete(agent.stop())
     except KeyboardInterrupt:
         pass
     finally:

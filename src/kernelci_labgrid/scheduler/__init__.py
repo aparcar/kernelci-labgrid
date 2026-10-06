@@ -1,6 +1,5 @@
 """Scheduler implementations for Labgrid integration."""
 
-from kernelci_labgrid.scheduler.push_scheduler import LabgridPushScheduler
-from kernelci_labgrid.scheduler.pull_agent import LabgridPullAgent
+from kernelci_labgrid.scheduler.pull_agent import LabgridAgent, LabgridPullAgent
 
-__all__ = ["LabgridPushScheduler", "LabgridPullAgent"]
+__all__ = ["LabgridAgent", "LabgridPullAgent"]

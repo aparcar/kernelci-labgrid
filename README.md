@@ -57,41 +57,35 @@ A single daemon that connects your Labgrid test lab to KernelCI. Runs locally in
 - Python 3.10+
 - Your existing test repository (e.g., openwrt-tests) with:
   - pytest tests in `tests/`
-  - labgrid target YAMLs in `targets/`
-- labgrid + pytest-labgrid installed
-- KernelCI API token
+  - labgrid target YAMLs in `targets/` (one per platform)
+  - a `uv` project at its root (the agent runs `uv run pytest` there by default)
+- A KernelCI (Maestro) API user in group `runtime:<lab-name>:node-editor`
+- Optional: a kernelci-storage token allowed to upload below `logs/<lab-name>/`
 
 ## Installation
 
 ```bash
-pip install kernelci-labgrid
-```
-
-Or from source:
-
-```bash
-git clone https://github.com/kernelci/kernelci-labgrid.git
+git clone https://github.com/aparcar/kernelci-labgrid.git
 cd kernelci-labgrid
-pip install -e .
+uv sync          # or: pip install -e .
 ```
 
 ## Usage
 
 ```bash
-# Set your API token
-export KCI_API_TOKEN="your-kernelci-api-token"
-
-# Run the agent (basic - jobs only)
+# Settings from a KEY=VALUE file (LAB_NAME, KCI_API_URL, LAB_API_TOKEN,
+# KCI_STORAGE_URL, LAB_STORAGE_TOKEN), e.g. openwrtci/deploy/runtime/tokens.env
 labgrid-agent \
-    --lab-name my-lab \
+    --env-file /path/to/tokens.env \
     --tests-dir /path/to/openwrt-tests/tests \
-    --targets-dir /path/to/openwrt-tests/targets
+    --platform qemu_armsr-armv8
 
-# Run with health checks enabled
+# With health checks
 labgrid-agent \
-    --lab-name my-lab \
+    --env-file /path/to/tokens.env \
     --tests-dir /path/to/openwrt-tests/tests \
-    --health-checks-dir /etc/labgrid/health_checks \
+    --platform qemu_armsr-armv8 \
+    --health-checks-dir examples/health_checks \
     --health-state-file /var/lib/labgrid/health_state.json
 ```
 
@@ -99,60 +93,66 @@ labgrid-agent \
 
 | Option | Description |
 |--------|-------------|
-| `--lab-name`, `-l` | Your lab name (jobs are filtered by this) |
-| `--tests-dir`, `-t` | Path to your pytest tests directory |
+| `--lab-name`, `-l` | Lab name, matched against the job's `data.runtime` (or `LAB_NAME`) |
+| `--tests-dir`, `-t` | Path to your pytest tests directory; its parent is the repo pytest runs in |
 | `--targets-dir` | Path to labgrid target YAMLs (default: tests/../targets) |
-| `--api-url` | KernelCI API URL (default: https://api.kernelci.org) |
-| `--api-token` | API token (or set `KCI_API_TOKEN` env) |
+| `--platform` | Platform this lab serves (`targets/<name>.yaml`), repeatable; default: all targets |
+| `--api-url` | API URL including version, e.g. `http://localhost:8001/latest` (or `KCI_API_URL`) |
+| `--api-token` | Lab API token (or `LAB_API_TOKEN` / `KCI_API_TOKEN`) |
+| `--storage-url`, `--storage-token` | kernelci-storage for log uploads (or `KCI_STORAGE_URL` / `LAB_STORAGE_TOKEN`) |
+| `--env-file` | Read the settings above from a KEY=VALUE file |
+| `--pytest-command` | How to run pytest in the tests repo (default: `uv run pytest`) |
 | `--poll-interval`, `-p` | Seconds between polls (default: 30) |
-| `--artifact-dir`, `-a` | Where to download artifacts |
+| `--once` | Poll once, wait for started jobs, exit |
+| `--artifact-dir`, `-a` | Where to download firmware and keep job outputs |
 | `--health-checks-dir`, `-c` | Directory with health check YAML configs (enables health checks) |
 | `--health-state-file`, `-s` | JSON file to persist device health state |
 | `--debug`, `-d` | Enable debug logging |
 
-### Environment Variables
-
-```bash
-KCI_API_URL=https://api.kernelci.org
-KCI_API_TOKEN=your-token
-LG_KERNEL=/path/to/kernel      # Set by agent, available in tests
-LG_ROOTFS=/path/to/rootfs      # Set by agent, available in tests
-LG_DTB=/path/to/dtb            # Set by agent, available in tests
-```
-
 ## How It Works
 
-1. **Agent polls** KernelCI API for pending jobs matching your lab name
-2. **Checks health** - runs scheduled health checks if due
-3. **Claims job** by setting state to "running"
-4. **Verifies device** - skips jobs for unhealthy devices
-5. **Downloads artifacts** (kernel, rootfs, etc.) to local directory
-6. **Runs pytest** with your tests and labgrid environment:
+1. **Checks health** - runs scheduled health checks if due (results stay local)
+2. **Polls** `GET /nodes?kind=job&state=available&data.runtime=<lab>&data.platform=<p>`
+   for each healthy platform, one job per platform at a time
+3. **Claims the job** by writing `data.job_id=<lab>:<uuid>` (best effort, like
+   kernelci/pullab_cloud, until kernelci-api has an atomic claim)
+4. **Fetches the job definition** from `artifacts.job_definition`, downloads the
+   firmware and verifies its sha256
+5. **Runs pytest** in the tests repo:
    ```bash
-   pytest --lg-env targets/platform.yaml tests/
+   uv run pytest <tests> --lg-env targets/<platform>.yaml --firmware <image> \
+       --lg-log=<out> --junit-xml=<out>/results.xml
    ```
-7. **Parses results** from JUnit XML output
-8. **Reports back** to KernelCI API (pass/fail, test cases, duration)
+6. **Uploads** console log, pytest log and JUnit XML to kernelci-storage
+7. **Reports back** with `PUT /nodes/<job>`: the job node plus one child per test
+   module and one leaf per test (paths `…/openwrt-tests/<module>/<test>`), and
+   creates a sibling `boot` test node under the build (result from `test_shell`)
+
+Failures where tests never ran (download, crash, timeout) mark the job
+`incomplete` with `error_code: Infrastructure`. Firmware that never reaches a
+shell (pytest exit code 3) is a real `fail`, not an infrastructure error.
 
 ## Health Checks
 
-Similar to LAVA, the agent can run periodic health checks to validate your devices are working correctly. Health checks run a golden image at regular intervals.
+Similar to LAVA, the agent can run periodic health checks with a known-good
+image. Results are kept local (state file) and only gate job execution: jobs
+for a `bad` device are left `available` for other labs.
 
 ### Health Check Configuration
 
 Create YAML files in your health checks directory:
 
 ```yaml
-# /etc/labgrid/health_checks/qemu-x86.yaml
-device: qemu-x86
-target: qemu-x86.yaml
+# /etc/labgrid/health_checks/qemu_armsr-armv8.yaml
+device: qemu_armsr-armv8
+target: qemu_armsr-armv8.yaml
 frequency_hours: 24
 
 golden_image:
-  kernel: https://storage.example.com/golden/bzImage
-  rootfs: https://storage.example.com/golden/rootfs.cpio.gz
+  firmware: https://downloads.openwrt.org/releases/25.12.5/targets/armsr/armv8/openwrt-25.12.5-armsr-armv8-generic-initramfs-kernel.bin
+  sha256: f510b0c73c1ee70a64df384d7e2ad4404caf83e6bc7cce9ac13426f77b9ae3be
 
-test_path: tests/health/test_boot.py
+test_path: tests/test_base.py::test_shell tests/test_base.py::test_ssh
 timeout: 600
 ```
 
@@ -164,47 +164,38 @@ timeout: 600
 | `bad` | Last health check failed - device is offline |
 | `unknown` | No health check has run yet |
 
-When a device is in `bad` state, the agent will skip jobs for that device until the next health check passes.
+When a device is in `bad` state, the agent skips jobs for that device until
+the next health check passes.
 
 ## Job Format
 
-Jobs in KernelCI API should have this structure:
+A job node in the KernelCI API (created by the scheduler):
 
 ```json
 {
-  "id": "node-id-123",
-  "name": "boot-test",
-  "state": "pending",
-  "data": {
-    "lab": "my-lab",
-    "platform": "qemu-x86-64",
-    "artifacts": {
-      "kernel": "https://storage.kernelci.org/.../bzImage",
-      "rootfs": "https://storage.kernelci.org/.../rootfs.cpio.gz"
-    },
-    "test_path": "test_boot.py",
-    "timeout": 600
-  }
+  "id": "6a1f...",
+  "kind": "job",
+  "name": "openwrt-tests",
+  "path": ["checkout", "armsr-armv8-generic", "openwrt-tests"],
+  "parent": "<build node id>",
+  "state": "available",
+  "artifacts": {"job_definition": "http://storage/openwrt/jobs/6a1f....json"},
+  "data": {"runtime": "openwrt-local", "platform": "qemu_armsr-armv8", "arch": "aarch64_generic"}
 }
 ```
 
-## Example with openwrt-tests
+The job definition it points to (PULL_LABS-shaped, plus a firmware artifact):
 
-```bash
-# Clone your test repo
-git clone https://github.com/aparcar/openwrt-tests.git
-cd openwrt-tests
-
-# Install dependencies
-pip install pytest pytest-labgrid labgrid kernelci-labgrid
-
-# Run the agent
-labgrid-agent \
-    --lab-name openwrt-lab \
-    --tests-dir ./tests \
-    --targets-dir ./targets \
-    --debug
+```json
+{
+  "artifacts": {"firmware": "http://storage/openwrt/releases/25.12.5/armsr/armv8/openwrt-...-initramfs-kernel.bin"},
+  "integrity": {"sha256": {"firmware": "f510b0c7..."}},
+  "tests": [{"id": "openwrt-tests", "type": "pytest", "parameters": "tests/", "timeout_s": 1800}],
+  "environment": {"platform": "qemu_armsr-armv8", "arch": "aarch64_generic", "requirements": ["wan_port"]}
+}
 ```
+
+`parameters` is the pytest selection, relative to the tests repo.
 
 ## Systemd Service
 
@@ -217,9 +208,8 @@ After=network-online.target
 [Service]
 Type=simple
 User=labgrid
-Environment="KCI_API_TOKEN=your-token"
 ExecStart=/usr/local/bin/labgrid-agent \
-    --lab-name my-lab \
+    --env-file /etc/labgrid/tokens.env \
     --tests-dir /opt/openwrt-tests/tests \
     --health-checks-dir /etc/labgrid/health_checks \
     --health-state-file /var/lib/labgrid/health_state.json
@@ -233,11 +223,8 @@ WantedBy=multi-user.target
 ## Development
 
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
 # Run tests
-pytest
+uv run --extra dev pytest tests/unit
 
 # Format code
 black src/ tests/

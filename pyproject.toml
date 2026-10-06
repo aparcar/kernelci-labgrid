@@ -28,6 +28,7 @@ keywords = ["kernelci", "labgrid", "testing", "embedded", "linux"]
 dependencies = [
     "aiohttp>=3.9.0",
     "pyyaml>=6.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
