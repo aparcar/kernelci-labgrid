@@ -7,49 +7,45 @@ A single daemon that connects your Labgrid test lab to KernelCI. Runs locally in
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                   KERNELCI CLOUD (unchanged)                    │
-│                                                                 │
-│   ┌──────────────┐       ┌──────────────┐                      │
-│   │ KernelCI API │       │   Maestro    │                      │
-│   │              │       │   Pipeline   │                      │
-│   └──────────────┘       └──────────────┘                      │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-                              ▲
-                              │ HTTPS (poll jobs, report results)
-                              │
-┌─────────────────────────────┼───────────────────────────────────┐
-│               YOUR LAB      │                                   │
-│                             │                                   │
-│   ┌─────────────────────────┴─────────────────────────────┐    │
-│   │                   labgrid-agent                       │    │
-│   │                                                       │    │
-│   │  1. Poll KernelCI API for pending jobs               │    │
-│   │  2. Run periodic health checks (like LAVA)           │    │
-│   │  3. Download artifacts (kernel, rootfs)              │    │
-│   │  4. pytest --lg-env targets/xxx.yaml tests/          │    │
-│   │  5. Report results back to API                       │    │
-│   └───────────────────────────┬───────────────────────────┘    │
-│                               │                                 │
-│                               │ runs your tests                 │
-│                               ▼                                 │
-│   ┌───────────────────────────────────────────────────────┐    │
-│   │              openwrt-tests (your repo)                │    │
-│   │                                                       │    │
-│   │  tests/test_*.py      <- pytest tests                │    │
-│   │  targets/*.yaml       <- labgrid environments        │    │
-│   │  conftest.py          <- fixtures                    │    │
-│   └───────────────────────────┬───────────────────────────┘    │
-│                               │                                 │
-│                               │ pytest-labgrid                  │
-│                               ▼                                 │
-│                    ┌─────────────────────┐                     │
-│                    │  labgrid-exporter   │                     │
-│                    │  + your boards      │                     │
-│                    └─────────────────────┘                     │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ KERNELCI INSTANCE (e.g. openwrtci, unchanged upstream services)  │
+│                                                                  │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌────────────────┐  │
+│  │ Maestro API      │  │ kernelci-storage │  │ KCIDB +        │  │
+│  │ jobs, results    │  │ firmware, logs   │  │ dashboard      │  │
+│  └──────────────────┘  └──────────────────┘  └────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
+              ▲                      ▲
+              │ HTTPS: poll, claim,  │ HTTPS: download firmware,
+              │ report results       │ upload logs
+              │                      │
+┌─────────────┼──────────────────────┼─────────────────────────────┐
+│ YOUR LAB    │                      │                             │
+│             │                      │                             │
+│  ┌──────────┴──────────────────────┴──────────────────────────┐  │
+│  │ labgrid-agent                                              │  │
+│  │                                                            │  │
+│  │  1. run due health checks (local, gate job execution)      │  │
+│  │  2. poll available jobs for this lab's platforms, claim    │  │
+│  │  3. fetch job definition, download + verify firmware       │  │
+│  │  4. uv run pytest --lg-env targets/<platform>.yaml         │  │
+│  │                   --firmware <image>                       │  │
+│  │  5. upload logs, submit test nodes + boot node             │  │
+│  └─────────────────────────────┬──────────────────────────────┘  │
+│                                │ runs your tests                 │
+│                                ▼                                 │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ openwrt-tests (your repo)                                  │  │
+│  │   tests/test_*.py   pytest tests                           │  │
+│  │   targets/*.yaml    labgrid environments                   │  │
+│  └─────────────────────────────┬──────────────────────────────┘  │
+│                                │ labgrid                         │
+│                                ▼                                 │
+│                  ┌───────────────────────────┐                   │
+│                  │ QEMU, or labgrid exporter │                   │
+│                  │ + your boards             │                   │
+│                  └───────────────────────────┘                   │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ## Requirements
@@ -72,17 +68,31 @@ uv sync          # or: pip install -e .
 
 ## Usage
 
-```bash
-# Settings from a KEY=VALUE file (LAB_NAME, KCI_API_URL, LAB_API_TOKEN,
-# KCI_STORAGE_URL, LAB_STORAGE_TOKEN), e.g. openwrtci/deploy/runtime/tokens.env
-labgrid-agent \
-    --env-file /path/to/tokens.env \
-    --tests-dir /path/to/openwrt-tests/tests \
-    --platform qemu_armsr-armv8
+Put the settings into a TOML file (see
+[`examples/labgrid-agent.toml`](examples/labgrid-agent.toml)) and run:
 
-# With health checks
+```bash
+labgrid-agent --config labgrid-agent.toml
+labgrid-agent --config labgrid-agent.toml --show-config   # effective settings, tokens masked
+```
+
+Without `--config` the agent reads `./labgrid-agent.toml`,
+`~/.config/labgrid-agent/config.toml` or `/etc/labgrid-agent/config.toml`
+(or `$LABGRID_AGENT_CONFIG`). Settings precedence, later wins: config file <
+`--env-file` < environment variables < command line options. So the file can
+hold everything, and single settings can be overridden ad hoc:
+
+```bash
+labgrid-agent --platform qemu_x86-64 --once
+```
+
+Without a config file, everything can be given as options and environment
+variables (`LAB_NAME`, `KCI_API_URL`, `LAB_API_TOKEN`, `KCI_STORAGE_URL`,
+`LAB_STORAGE_TOKEN`, also readable from a KEY=VALUE `--env-file`):
+
+```bash
 labgrid-agent \
-    --env-file /path/to/tokens.env \
+    --env-file /path/to/lab.env \
     --tests-dir /path/to/openwrt-tests/tests \
     --platform qemu_armsr-armv8 \
     --health-checks-dir examples/health_checks \
@@ -100,6 +110,8 @@ labgrid-agent \
 | `--api-url` | API URL including version, e.g. `http://localhost:8001/latest` (or `KCI_API_URL`) |
 | `--api-token` | Lab API token (or `LAB_API_TOKEN` / `KCI_API_TOKEN`) |
 | `--storage-url`, `--storage-token` | kernelci-storage for log uploads (or `KCI_STORAGE_URL` / `LAB_STORAGE_TOKEN`) |
+| `--config` | TOML config file (see above) |
+| `--show-config` | Print the effective settings and exit |
 | `--env-file` | Read the settings above from a KEY=VALUE file |
 | `--pytest-command` | How to run pytest in the tests repo (default: `uv run pytest`) |
 | `--poll-interval`, `-p` | Seconds between polls (default: 30) |
@@ -208,11 +220,8 @@ After=network-online.target
 [Service]
 Type=simple
 User=labgrid
-ExecStart=/usr/local/bin/labgrid-agent \
-    --env-file /etc/labgrid/tokens.env \
-    --tests-dir /opt/openwrt-tests/tests \
-    --health-checks-dir /etc/labgrid/health_checks \
-    --health-state-file /var/lib/labgrid/health_state.json
+# all settings in /etc/labgrid-agent/config.toml (see examples/labgrid-agent.toml)
+ExecStart=/usr/local/bin/labgrid-agent
 Restart=always
 RestartSec=10
 

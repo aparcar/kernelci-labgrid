@@ -1,0 +1,43 @@
+# Example labgrid-agent configuration.
+#
+#   labgrid-agent --config labgrid-agent.toml
+#   labgrid-agent --config labgrid-agent.toml --show-config   # check settings
+#
+# Without --config the agent reads ./labgrid-agent.toml,
+# ~/.config/labgrid-agent/config.toml or /etc/labgrid-agent/config.toml.
+# Precedence (later wins): this file < --env-file < environment variables
+# (LAB_NAME, KCI_API_URL, LAB_API_TOKEN, KCI_STORAGE_URL, LAB_STORAGE_TOKEN)
+# < command line options.
+#
+# On openwrtci, Ansible generates a ready-to-use file per lab
+# (ansible/secrets/<server>/labs/<lab>.toml). Keep it secret: it holds tokens.
+#
+# Plain keys go first: TOML assigns keys after a [table] header to that table.
+
+# Lab name; must match the runtime of the jobs (data.runtime)
+lab_name = "my-lab"
+
+# Platforms this lab serves: labgrid target files targets/<platform>.yaml
+platforms = ["qemu_armsr-armv8", "qemu_x86-64"]
+
+# Tests directory of your test repository (e.g. openwrt-tests); its parent is
+# the repository pytest runs in. Relative paths are relative to this file.
+tests_dir = "openwrt-tests/tests"
+
+# Optional settings (defaults shown)
+# targets_dir = "openwrt-tests/targets"   # default: <tests_dir>/../targets
+# pytest_command = "uv run pytest"         # run inside the tests repository
+# poll_interval = 30                       # seconds between polls
+# artifact_dir = "/var/lib/labgrid-agent/artifacts"   # default: a temp dir
+# health_checks_dir = "/etc/labgrid-agent/health_checks"
+# health_state_file = "/var/lib/labgrid-agent/health.json"
+
+# Maestro (KernelCI) API, including the version prefix
+[api]
+url = "https://api.example.org/latest"
+token = "<lab API token>"
+
+# kernelci-storage for log uploads (optional; without it logs stay local)
+[storage]
+url = "https://files.example.org/"
+token = "<lab storage token>"
