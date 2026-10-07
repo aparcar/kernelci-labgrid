@@ -297,9 +297,14 @@ class LabgridAgent:
         if self._labgrid:
             logger.info(f"labgrid coordinator: {self._labgrid.address}")
             await self._refresh_platforms()
-        elif not self.platforms:
-            self.platforms = sorted(p.stem for p in self.targets_dir.glob("*.yaml"))
-        logger.info(f"Platforms: {', '.join(self.platforms) or '-'}")
+        else:
+            # QEMU-only lab: exactly the configured platforms
+            logger.info("No labgrid coordinator: local (QEMU) platforms only")
+            if not self.platforms:
+                raise RuntimeError("No coordinator and no platforms configured: set "
+                                   "`coordinator` for real hardware or `platforms` for QEMU")
+            # (with a coordinator, _refresh_platforms logs the list)
+            logger.info(f"Platforms: {', '.join(self.platforms)}")
 
         # Load health check configs if directory provided
         if self.health_checks_dir:
@@ -747,6 +752,7 @@ class LabgridAgent:
         # every build, a name-only cache would serve a stale image.
         dest_dir = dest_dir / (sha256[:16] if sha256 else "unverified")
         dest_dir.mkdir(parents=True, exist_ok=True)
+        self._make_traversable(dest_dir)
         path = dest_dir / url.rsplit("/", 1)[-1]
 
         if not path.exists():
@@ -780,7 +786,18 @@ class LabgridAgent:
                     raise RuntimeError(f"Failed to unpack {path.name}")
             path = unpacked
 
+        # labgrid stages firmware for TFTP by symlinking it when the exporter
+        # is on this host, so the TFTP server's user must be able to read it
+        path.chmod(0o644)
         return path
+
+    def _make_traversable(self, directory: Path) -> None:
+        """chmod 0755 from artifact_dir down to `directory` (mkdtemp is 0700)."""
+        directory = directory.resolve()
+        root = self.artifact_dir.resolve()
+        chain = [directory, *directory.parents]
+        for d in chain[: chain.index(root) + 1] if root in chain else [directory]:
+            d.chmod(0o755)
 
     @staticmethod
     def _sha256(path: Path) -> str:
@@ -1207,8 +1224,8 @@ def main() -> None:
     parser.add_argument("--health-checks-dir", "-c",
                         help="Directory with health check YAML configs (enables health checks)")
     parser.add_argument("--health-state-file", "-s", help="JSON file to persist device health state")
-    parser.add_argument("--coordinator", help="The lab's labgrid-coordinator host:port; enables real "
-                                              "hardware (or LG_COORDINATOR)")
+    parser.add_argument("--coordinator", help="The lab's labgrid-coordinator host:port (default: "
+                                              "127.0.0.1:20408 or LG_COORDINATOR; '' for QEMU only)")
     parser.add_argument("--labgrid-command", help="labgrid-client command for power off "
                                                   "(default: labgrid-client of this environment)")
     parser.add_argument("--reserve-timeout", type=int,
@@ -1238,6 +1255,10 @@ def main() -> None:
                       ("tests_dir", "--tests-dir / tests_dir")):
         if not settings[key]:
             parser.error(f"{key} required ({hint})")
+
+    if not settings["coordinator"] and not settings["platforms"]:
+        parser.error("no coordinator and no platforms: set `coordinator` (real hardware) "
+                     "or `platforms` (QEMU-only lab, with coordinator = \"\")")
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,

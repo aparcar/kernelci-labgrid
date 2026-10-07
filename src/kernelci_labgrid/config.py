@@ -14,7 +14,7 @@ TOML assigns later keys to the table above them):
     # strategies_dir: default <targets_dir>/../strategies
     # poll_interval = 30
     # pytest_command: default `python -m pytest` in the agent's environment
-    # coordinator = "127.0.0.1:20408"      # real hardware via labgrid
+    # coordinator = "127.0.0.1:20408"      # default; "" for a QEMU-only lab
     # artifact_dir, targets_dir, health_checks_dir, health_state_file
 
     [api]
@@ -54,8 +54,8 @@ DEFAULTS: dict[str, Any] = {
     "artifact_dir": None,
     "health_checks_dir": None,
     "health_state_file": None,
-    # Real hardware: the lab's labgrid-coordinator (host:port); unset = QEMU only
-    "coordinator": None,
+    # Real hardware: the lab's labgrid-coordinator (host:port); "" = QEMU only
+    "coordinator": "127.0.0.1:20408",
     "labgrid_command": None,
     "reserve_timeout": 60,
 }
