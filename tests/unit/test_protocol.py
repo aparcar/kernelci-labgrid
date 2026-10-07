@@ -153,10 +153,12 @@ class TestClaim:
 
         async def fake_put(endpoint, data):
             calls["put"].append((endpoint, data))
+            state["node"] = dict(data, data=dict(data["data"]))
             return data
 
         monkeypatch.setattr(agent, "_api_get", fake_get)
         monkeypatch.setattr(agent, "_api_put", fake_put)
+        monkeypatch.setattr("kernelci_labgrid.scheduler.pull_agent.random.uniform", lambda a, b: 0)
         return calls, state
 
     async def test_claims_available_job(self, agent, api):
@@ -190,6 +192,35 @@ class TestClaim:
         assert params["data.runtime"] == "openwrt-local"
         assert params["data.platform"] == "qemu_armsr-armv8"
         assert "qemu_armsr-armv8" in agent._busy_platforms
+
+    async def test_lost_race_backs_off(self, agent, api, monkeypatch):
+        calls, state = api
+
+        async def racing_put(endpoint, data):
+            calls["put"].append((endpoint, data))
+            # Another lab writes its claim right after ours
+            state["node"] = dict(data, data=dict(data["data"], job_id="other-lab:xyz"))
+            return data
+
+        monkeypatch.setattr(agent, "_api_put", racing_put)
+        assert await agent._claim(JOB) is None
+
+    async def test_pool_job_moves_to_lab(self, agent, api):
+        calls, state = api
+        agent.pool = "openwrt-labs"
+        state["node"]["data"]["runtime"] = "openwrt-labs"
+        claimed = await agent._claim(state["node"])
+        assert claimed["data"]["runtime"] == "openwrt-local"
+        assert claimed["data"]["pool"] == "openwrt-labs"
+
+    async def test_polls_lab_then_pool(self, agent, api, monkeypatch):
+        calls, state = api
+        agent.pool = "openwrt-labs"
+        state["node"]["data"]["job_id"] = "other-lab:abc"  # nothing claimable
+        await agent._poll_and_execute()
+        runtimes = [p["data.runtime"] for e, p in calls["get"] if e == "/nodes"]
+        assert runtimes == ["openwrt-local", "openwrt-labs"]
+        assert not calls["put"]
 
     async def test_unhealthy_platform_not_polled(self, agent, api):
         from kernelci_labgrid.scheduler.pull_agent import DeviceHealth

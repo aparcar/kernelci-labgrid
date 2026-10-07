@@ -63,6 +63,13 @@ class TestResolveSettings:
         assert s["platforms"] == []
         assert s["coordinator"] == "127.0.0.1:20408"
 
+    def test_pool(self, tmp_path):
+        path = tmp_path / "c.toml"
+        path.write_text('pool = "openwrt-labs"\n')
+        assert resolve_settings({}, environ={})["pool"] is None
+        assert resolve_settings({}, config_path=path, environ={})["pool"] == "openwrt-labs"
+        assert resolve_settings({}, environ={"LAB_POOL": "x"})["pool"] == "x"
+
     def test_empty_coordinator_disables_hardware(self, tmp_path):
         path = tmp_path / "c.toml"
         path.write_text('coordinator = ""\nplatforms = ["qemu_x86-64"]\n')

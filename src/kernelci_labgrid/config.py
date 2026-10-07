@@ -58,6 +58,8 @@ DEFAULTS: dict[str, Any] = {
     "coordinator": "127.0.0.1:20408",
     "labgrid_command": None,
     "reserve_timeout": 60,
+    # Shared runtime several labs take jobs from (e.g. "openwrt-labs")
+    "pool": None,
 }
 
 # Settings that are paths; relative ones are resolved against the config file
@@ -79,6 +81,7 @@ ENV_KEYS = {
     "health_checks_dir": ("LABGRID_HEALTH_CHECKS_DIR",),
     "health_state_file": ("LABGRID_HEALTH_STATE_FILE",),
     "coordinator": ("LG_COORDINATOR",),
+    "pool": ("LAB_POOL",),
 }
 
 SECRET_KEYS = ("api_token", "storage_token")
