@@ -24,6 +24,13 @@ TOML assigns later keys to the table above them):
     [storage]
     url = "https://files.example.org/"
     token = "..."
+
+    # Health checks for all platforms; golden images from the target files
+    [health_checks]
+    # frequency_hours = 24
+
+    [health_checks.rpi-4]
+    enabled = false
 """
 
 from __future__ import annotations
@@ -54,6 +61,9 @@ DEFAULTS: dict[str, Any] = {
     "artifact_dir": None,
     "health_checks_dir": None,
     "health_state_file": None,
+    # [health_checks] table (even empty): health checks for all platforms;
+    # plain keys apply to all, [health_checks.<device>] tables per device
+    "health_checks": None,
     # Real hardware: the lab's labgrid-coordinator (host:port); "" = QEMU only
     "coordinator": "127.0.0.1:20408",
     "labgrid_command": None,

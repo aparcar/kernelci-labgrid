@@ -126,7 +126,7 @@ labgrid-agent \
 | `--poll-interval`, `-p` | Seconds between polls (default: 30) |
 | `--once` | Poll once, wait for started jobs, exit |
 | `--artifact-dir`, `-a` | Where to download firmware and keep job outputs |
-| `--health-checks-dir`, `-c` | Directory with health check YAML configs (enables health checks) |
+| `--health-checks-dir`, `-c` | Directory with health check TOML files, one per device |
 | `--health-state-file`, `-s` | JSON file to persist device health state |
 | `--debug`, `-d` | Enable debug logging |
 
@@ -197,21 +197,61 @@ for a `bad` device are left `available` for other labs.
 
 ### Health Check Configuration
 
-Create YAML files in your health checks directory:
+An (even empty) `[health_checks]` table in the agent's config file enables
+health checks for all platforms of the lab (keep it after the plain keys,
+like `[api]`):
+
+```toml
+[health_checks]
+```
+
+The golden image comes from the device's target file in openwrt-tests, so
+every lab boots the same one: its `openwrt:` section names the image
+(`target`, `profile`, `image.type`/`filesystem`, as in openwrt-tests'
+`scripts/healthcheck.sh`), the sha256 comes from the release's
+`profiles.json`. The release is the target's `healthcheck_version` if set
+(for boards that regressed), `SNAPSHOT` for `snapshots_only` targets, else
+the lab's `release` setting, else the current stable release
+(downloads.openwrt.org/.versions.json).
 
 ```yaml
-# /etc/labgrid/health_checks/qemu_armsr-armv8.yaml
-device: qemu_armsr-armv8
-target: qemu_armsr-armv8.yaml
-frequency_hours: 24
-
-golden_image:
-  firmware: https://downloads.openwrt.org/releases/25.12.5/targets/armsr/armv8/openwrt-25.12.5-armsr-armv8-generic-initramfs-kernel.bin
-  sha256: f510b0c73c1ee70a64df384d7e2ad4404caf83e6bc7cce9ac13426f77b9ae3be
-
-test_path: tests/test_base.py::test_shell tests/test_base.py::test_ssh
-timeout: 600
+# openwrt-tests targets/enterasys_ws-ap3710i.yaml
+openwrt:
+  target: mpc85xx-p1020
+  profile: enterasys_ws-ap3710i
+  image: {type: kernel}
+  healthcheck_version: "23.05.5"
 ```
+
+Plain keys in `[health_checks]` apply to all devices, `[health_checks.<device>]`
+tables override them per device:
+
+```toml
+[health_checks]
+frequency_hours = 12
+
+[health_checks.rpi-4]
+enabled = false                  # no health check for this device
+
+[health_checks.openwrt_one]
+firmware = "https://example.org/my-known-good.itb"   # explicit golden image
+sha256 = "…"
+```
+
+| Key | Description |
+|-----|-------------|
+| `test_path` | pytest selection relative to `tests_dir` (default: `test_base.py::test_shell test_base.py::test_ssh`) |
+| `frequency_hours` | How often to run (default: 24) |
+| `timeout` | Seconds (default: 600) |
+| `release` | Golden image release unless the target pins one (default: current stable) |
+| `firmware`, `sha256` | Explicit golden image instead of the target file's |
+| `enabled` | `false` skips the device |
+| `target` | labgrid target file (default: `<device>.yaml`) |
+
+Set `health_state_file` to keep results across restarts. Alternatively,
+`health_checks_dir` holds one TOML file per device with the same keys plus
+`device` (default: the file name); without a `[health_checks]` table only
+those devices are checked. See [`examples/health_checks/`](examples/health_checks/).
 
 ### Device Health States
 
