@@ -20,8 +20,8 @@ golden_image:
   firmware: https://downloads.openwrt.org/releases/25.12.5/targets/armsr/armv8/openwrt-25.12.5-armsr-armv8-generic-initramfs-kernel.bin
   sha256: f510b0c73c1ee70a64df384d7e2ad4404caf83e6bc7cce9ac13426f77b9ae3be
 
-# pytest selection relative to the tests repo (empty = tests/)
-test_path: tests/test_base.py::test_shell tests/test_base.py::test_ssh
+# pytest selection relative to tests_dir (empty = all tests)
+test_path: test_base.py::test_shell test_base.py::test_ssh
 
 # Test timeout in seconds
 timeout: 600

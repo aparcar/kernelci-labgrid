@@ -6,7 +6,8 @@
 # Without --config the agent reads ./labgrid-agent.toml,
 # ~/.config/labgrid-agent/config.toml or /etc/labgrid-agent/config.toml.
 # Precedence (later wins): this file < --env-file < environment variables
-# (LAB_NAME, KCI_API_URL, LAB_API_TOKEN, KCI_STORAGE_URL, LAB_STORAGE_TOKEN)
+# (LAB_NAME, KCI_API_URL, LAB_API_TOKEN, KCI_STORAGE_URL, LAB_STORAGE_TOKEN,
+# LG_COORDINATOR, LABGRID_* paths)
 # < command line options.
 #
 # On openwrtci, Ansible generates a ready-to-use file per lab
@@ -17,16 +18,28 @@
 # Lab name; must match the runtime of the jobs (data.runtime)
 lab_name = "my-lab"
 
-# Platforms this lab serves: labgrid target files targets/<platform>.yaml
-platforms = ["qemu_armsr-armv8", "qemu_x86-64"]
+# The lab's own labgrid-coordinator. Its places' `device=<platform>` tags
+# are the hardware platforms this lab serves; places are reserved and locked
+# per job (LG_COORDINATOR also works). Leave unset for a QEMU-only lab.
+coordinator = "127.0.0.1:20408"
 
-# Tests directory of your test repository (e.g. openwrt-tests); its parent is
-# the repository pytest runs in. Relative paths are relative to this file.
+# Optional: restrict the discovered hardware platforms, and add local QEMU
+# platforms (labgrid target files targets/<platform>.yaml). Without a
+# coordinator this is the full list.
+# platforms = ["openwrt_one", "qemu_x86-64"]
+
+# The test suite (pytest tests incl. conftest.py), the labgrid target files
+# and the labgrid strategies they import. They can live anywhere; relative
+# paths are relative to this file. pytest runs in tests_dir with the agent's
+# own Python, which includes labgrid, pytest-check and pytest-harvest.
 tests_dir = "openwrt-tests/tests"
+targets_dir = "openwrt-tests/targets"     # default: <tests_dir>/../targets
+# strategies_dir = "openwrt-tests/strategies"   # default: <targets_dir>/../strategies
 
 # Optional settings (defaults shown)
-# targets_dir = "openwrt-tests/targets"   # default: <tests_dir>/../targets
-# pytest_command = "uv run pytest"         # run inside the tests repository
+# pytest_command = "uv run pytest"         # e.g. for a suite with its own environment
+# labgrid_command = "labgrid-client"       # for power off; default: this environment's
+# reserve_timeout = 60                     # seconds to wait for a free place
 # poll_interval = 30                       # seconds between polls
 # artifact_dir = "/var/lib/labgrid-agent/artifacts"   # default: a temp dir
 # health_checks_dir = "/etc/labgrid-agent/health_checks"

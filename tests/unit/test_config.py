@@ -59,7 +59,7 @@ class TestResolveSettings:
     def test_defaults(self):
         s = resolve_settings({}, environ={})
         assert s["api_url"] == "https://api.kernelci.org/latest"
-        assert s["pytest_command"] == "uv run pytest"
+        assert s["pytest_command"] is None  # agent uses its own python -m pytest
         assert s["platforms"] == []
 
     def test_precedence(self, config, tmp_path):
@@ -107,3 +107,11 @@ def test_describe_masks_secrets(config):
     assert "api-secret-token" not in out
     assert "storage-secret-token" not in out
     assert "lynxis" in out
+
+
+def test_path_environment_beats_config(config):
+    """Container images point tests_dir etc. at their own layout."""
+    s = resolve_settings({}, config_path=config,
+                         environ={"LABGRID_TESTS_DIR": "/opt/openwrt-tests/tests"})
+    assert s["tests_dir"] == "/opt/openwrt-tests/tests"
+    assert s["lab_name"] == "lynxis"
