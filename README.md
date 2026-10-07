@@ -159,6 +159,12 @@ Failures where tests never ran (download, crash, timeout) mark the job
 `incomplete` with `error_code: Infrastructure`. Firmware that never reaches a
 shell (pytest exit code 3) is a real `fail`, not an infrastructure error.
 
+Ctrl-C (SIGINT/SIGTERM) stops right away: running jobs are cancelled (pytest
+and QEMU killed, the place powered off and unlocked) and given back to the
+queue, pool jobs to the pool, so another lab or the next run picks them up.
+A second Ctrl-C kills the test processes and exits immediately, leaving
+places locked.
+
 ## Real hardware (labgrid)
 
 Each lab runs its own labgrid-coordinator; the agent runs in the lab next to
