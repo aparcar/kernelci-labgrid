@@ -111,6 +111,8 @@ class TestBuildHierarchy:
         assert node["artifacts"]["job_definition"] == JOB["artifacts"]["job_definition"]
         assert node["artifacts"]["test_log"] == "http://storage/console"
         assert node["data"]["device"] == "openwrt-local-qemu_armsr-armv8"
+        assert node["data"]["summary"] == {
+            "total": 4, "passed": 2, "failed": 1, "errors": 0, "skipped": 1, "boot": "pass"}
 
         modules = {c["node"]["name"]: c for c in h["child_nodes"]}
         assert set(modules) == {"base", "lan", "wifi"}
@@ -179,7 +181,7 @@ class TestClaim:
     async def test_poll_query(self, agent, api, monkeypatch):
         calls, _ = api
         started = []
-        monkeypatch.setattr(agent, "_execute_job", lambda job: _record(started, job))
+        monkeypatch.setattr(agent, "_execute_job", lambda job, lease=None: _record(started, job))
         await agent._poll_and_execute()
         endpoint, params = calls["get"][0]
         assert endpoint == "/nodes"
