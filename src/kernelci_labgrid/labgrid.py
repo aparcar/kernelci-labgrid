@@ -63,11 +63,18 @@ class Lease:
     refresher: asyncio.Task | None = None
 
 
+# Process groups started by spawn(), for kill_all() on abort
+_children: set[asyncio.subprocess.Process] = set()
+
+
 async def spawn(*cmd: str, **kwargs) -> asyncio.subprocess.Process:
     """Start a command in its own process group, so kill_group() also stops
     what `uv run` starts underneath it (otherwise the child keeps running and
-    holds our pipes open, and asyncio waits forever)."""
-    return await asyncio.create_subprocess_exec(*cmd, start_new_session=True, **kwargs)
+    holds our pipes open, and asyncio waits forever). Being in its own group,
+    it does not get the terminal's Ctrl-C: the agent stops it."""
+    proc = await asyncio.create_subprocess_exec(*cmd, start_new_session=True, **kwargs)
+    _children.add(proc)
+    return proc
 
 
 async def kill_group(proc: asyncio.subprocess.Process) -> None:
@@ -77,6 +84,18 @@ async def kill_group(proc: asyncio.subprocess.Process) -> None:
         except ProcessLookupError:
             pass
         await proc.wait()
+    _children.discard(proc)
+
+
+def kill_all() -> None:
+    """Kill all process groups started by spawn() (synchronous, for exit)."""
+    for proc in list(_children):
+        if proc.returncode is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    _children.clear()
 
 
 def child_env() -> dict[str, str]:
@@ -94,6 +113,8 @@ class Coordinator:
         self.labgrid_command = shlex.split(labgrid_command)
         self.cwd = cwd
         self.session: ClientSession | None = None
+        # Set when the agent stops: reserve() gives up waiting for a place
+        self.stopping = False
 
     # --- connection --------------------------------------------------------
 
@@ -144,7 +165,7 @@ class Coordinator:
 
         place = None
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and not self.stopping:
             res = await self._poll(token)
             if res.state is ReservationState.allocated:
                 place = (res.allocations.get("main") or [None])[0]
@@ -154,9 +175,10 @@ class Coordinator:
                 break
             await asyncio.sleep(1)
 
-        if not place:
+        if not place or self.stopping:
             await self.cancel(token)
-            logger.info(f"No place for {platform} within {timeout:.0f}s")
+            if not self.stopping:
+                logger.info(f"No place for {platform} within {timeout:.0f}s")
             return None
 
         try:

@@ -32,6 +32,7 @@ import json
 import logging
 import shlex
 import shutil
+import os
 import signal
 import socket
 import sys
@@ -46,7 +47,15 @@ from typing import Any
 import aiohttp
 import yaml
 
-from kernelci_labgrid.labgrid import Coordinator, Lease, Place, child_env, kill_group, spawn
+from kernelci_labgrid.labgrid import (
+    Coordinator,
+    Lease,
+    Place,
+    child_env,
+    kill_all,
+    kill_group,
+    spawn,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +286,9 @@ class LabgridAgent:
         # Runtime state
         self._session: aiohttp.ClientSession | None = None
         self._running = False
+        self._stopping = False
+        self._stop_event = asyncio.Event()
+        self._job_tasks: set[asyncio.Task] = set()
         self._current_jobs: set[str] = set()
         self._busy_platforms: set[str] = set()
         self._health_configs: dict[str, HealthCheckConfig] = {}
@@ -322,21 +334,45 @@ class LabgridAgent:
         self._running = True
         logger.info("Agent started")
 
+    def request_stop(self) -> None:
+        """Signal handler: stop polling and cancel running jobs (they go back
+        to the queue). A second call kills everything and exits at once."""
+        if self._stopping:
+            logger.warning("Aborting: killing test processes, places stay locked")
+            kill_all()
+            os._exit(130)
+        self._stopping = True
+        logger.info("Stopping: cancelling running jobs (press Ctrl-C again to abort)")
+        self._running = False
+        self._stop_event.set()
+        if self._labgrid:
+            self._labgrid.stopping = True
+        for task in self._job_tasks:
+            task.cancel()
+
+    async def _sleep(self, seconds: float) -> None:
+        """Sleep, but wake up when the agent is stopped."""
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+
     async def stop(self) -> None:
-        """Stop the agent."""
+        """Stop the agent: cancel running jobs, close connections."""
         logger.info("Stopping agent")
         self._running = False
 
         # Save health state
         self._save_health_state()
 
-        # Wait for current jobs
-        if self._current_jobs:
-            logger.info(f"Waiting for {len(self._current_jobs)} jobs...")
-            for _ in range(60):
-                if not self._current_jobs:
-                    break
-                await asyncio.sleep(1)
+        # Running jobs are cancelled and requeued; this waits for their
+        # cleanup (kill pytest, power off, unlock the place)
+        tasks = list(self._job_tasks)
+        if tasks:
+            logger.info(f"Cancelling {len(tasks)} running job(s)...")
+            for task in tasks:
+                task.cancel()
+            await asyncio.wait(tasks, timeout=120)
 
         if self._session:
             await self._session.close()
@@ -369,11 +405,11 @@ class LabgridAgent:
                 logger.exception(f"Loop error: {e}")
 
             if once:
-                while self._current_jobs:
-                    await asyncio.sleep(1)
+                while self._current_jobs and self._running:
+                    await self._sleep(1)
                 break
 
-            await asyncio.sleep(self.poll_interval)
+            await self._sleep(self.poll_interval)
 
     # ==================== Health Check Methods ====================
     #
@@ -594,6 +630,8 @@ class LabgridAgent:
             await self._refresh_platforms()
 
         for platform in self.platforms:
+            if self._stopping:
+                break
             if platform in self._busy_platforms:
                 continue
 
@@ -634,12 +672,19 @@ class LabgridAgent:
                     continue
 
             for job in jobs:
+                if self._stopping:
+                    break
                 claimed = await self._claim(job)
                 if not claimed:
                     continue
+                if self._stopping:  # stopped while claiming
+                    await self._unclaim(claimed)
+                    break
                 self._current_jobs.add(claimed["id"])
                 self._busy_platforms.add(platform)
-                asyncio.create_task(self._execute_job(claimed, lease))
+                task = asyncio.create_task(self._execute_job(claimed, lease))
+                self._job_tasks.add(task)
+                task.add_done_callback(self._job_tasks.discard)
                 break  # one job per platform at a time
             else:
                 if lease:
@@ -751,6 +796,11 @@ class LabgridAgent:
             logger.info(f"Completed {job_name}: {self._job_result(result)} "
                         f"({result.passed} passed, {result.failed} failed, "
                         f"{result.skipped} skipped)")
+
+        except asyncio.CancelledError:
+            logger.info(f"Cancelled {job_name} ({node_id}), returning it to the queue")
+            await self._unclaim(job)
+            raise
 
         except Exception as e:
             logger.exception(f"Job failed: {job_name}")
@@ -975,6 +1025,12 @@ class LabgridAgent:
                 except asyncio.TimeoutError:
                     await kill_group(proc)
                     log.write(f"\nlabgrid-agent: timed out after {timeout}s\n".encode())
+                except asyncio.CancelledError:
+                    await kill_group(proc)
+                    log.write(b"\nlabgrid-agent: stopped\n")
+                    raise
+                else:
+                    await kill_group(proc)  # exited: just forget it
         except Exception as e:
             return TestResult(errors=1, output=str(e), outdir=outdir)
 
@@ -1175,6 +1231,25 @@ class LabgridAgent:
                 "data": self._node_data(job),
             })
 
+    async def _unclaim(self, job: dict[str, Any]) -> None:
+        """Give a claimed job back (agent stopped before finishing it): drop
+        our claim and return a pool job to the pool; never raises."""
+        node_id = job["id"]
+        claim_id = (job.get("data") or {}).get("job_id")
+        try:
+            current = await self._api_get(f"/node/{node_id}")
+            data = current.get("data") or {}
+            if current.get("state") != "available" or data.get("job_id") != claim_id:
+                return
+            data.pop("job_id", None)
+            data.pop("worker", None)
+            if data.get("pool"):
+                data["runtime"] = data.pop("pool")
+            current["data"] = data
+            await self._api_put(f"/node/{node_id}", self._writable(current))
+        except Exception as e:
+            logger.error(f"Failed to return job {node_id} to the queue: {e}")
+
     async def _report_failure(self, job: dict[str, Any], error: str,
                               outdir: Path | None = None) -> None:
         """Report an infrastructure failure (tests never ran or crashed)."""
@@ -1322,7 +1397,7 @@ def main() -> None:
     # Signal handling
     loop = asyncio.new_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(agent.stop()))
+        loop.add_signal_handler(sig, agent.request_stop)
 
     try:
         loop.run_until_complete(agent.run(once=args.once))
