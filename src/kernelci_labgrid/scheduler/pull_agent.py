@@ -45,8 +45,13 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
-import yaml
 
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover
+    import tomli as tomllib
+
+from kernelci_labgrid.firmware import VERSIONS_URL, TargetImage
 from kernelci_labgrid.labgrid import (
     Coordinator,
     Lease,
@@ -148,31 +153,67 @@ class DeviceHealth:
         )
 
 
+# openwrt-tests' healthcheck: the device boots and is reachable
+DEFAULT_HEALTH_TESTS = "test_base.py::test_shell test_base.py::test_ssh"
+
+
 @dataclass
 class HealthCheckConfig:
-    """Configuration for a device health check."""
+    """Configuration for a device health check.
+
+    Without `firmware`, the golden image comes from the device's target file
+    (see kernelci_labgrid.firmware), so all labs use the same one.
+    """
 
     device: str
     target: str  # labgrid target YAML filename
     frequency_hours: int = 24
-    golden_image: dict[str, str] = field(default_factory=dict)
-    test_path: str = ""  # pytest selection relative to tests_dir, empty = all
-    timeout: int = 3600
+    golden_image: dict[str, str] = field(default_factory=dict)  # firmware URL, sha256
+    release: str = ""  # golden image release unless the target pins one
+    test_path: str = DEFAULT_HEALTH_TESTS  # pytest selection relative to tests_dir
+    timeout: int = 600
+    enabled: bool = True
+
+    KEYS = ("device", "target", "frequency_hours", "firmware", "sha256", "release",
+            "test_path", "timeout", "enabled")
 
     @classmethod
-    def from_yaml(cls, path: Path) -> "HealthCheckConfig":
-        """Load config from YAML file."""
-        with open(path) as f:
-            data = yaml.safe_load(f)
-
+    def from_dict(cls, device: str, data: dict[str, Any]) -> "HealthCheckConfig":
+        """From TOML keys: firmware + sha256 (explicit golden image), release,
+        test_path, frequency_hours, timeout, target (default <device>.yaml),
+        enabled."""
+        unknown = set(data) - set(cls.KEYS)
+        if unknown:
+            raise ValueError(f"unknown health check settings: {', '.join(sorted(unknown))}")
+        golden = {k: data[k] for k in ("firmware", "sha256") if data.get(k)}
+        if golden and "firmware" not in golden:
+            raise ValueError("`sha256` without `firmware`")
         return cls(
-            device=data["device"],
-            target=data.get("target", f"{data['device']}.yaml"),
+            device=device,
+            target=data.get("target", f"{device}.yaml"),
             frequency_hours=data.get("frequency_hours", 24),
-            golden_image=data.get("golden_image", {}),
-            test_path=data.get("test_path", ""),
-            timeout=data.get("timeout", 3600),
+            golden_image=golden,
+            release=str(data.get("release", "")),
+            test_path=data.get("test_path", DEFAULT_HEALTH_TESTS),
+            timeout=data.get("timeout", 600),
+            enabled=bool(data.get("enabled", True)),
         )
+
+    @staticmethod
+    def split_table(table: dict[str, Any]) -> tuple[dict[str, Any], dict[str, dict]]:
+        """A [health_checks] table: plain keys are defaults for all devices,
+        sub-tables ([health_checks.<device>]) per-device settings."""
+        defaults = {k: v for k, v in table.items() if not isinstance(v, dict)}
+        devices = {k: v for k, v in table.items() if isinstance(v, dict)}
+        return defaults, devices
+
+    @classmethod
+    def from_toml(cls, path: Path) -> "HealthCheckConfig":
+        """One device per file: `device = "..."` plus the keys above
+        (default device: the file name)."""
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        return cls.from_dict(data.pop("device", path.stem), data)
 
 
 # ==================== Main Agent ====================
@@ -211,6 +252,7 @@ class LabgridAgent:
         default_timeout: int = 3600,
         # Health check options
         health_checks_dir: str | Path | None = None,
+        health_checks: dict[str, Any] | None = None,
         health_state_file: str | Path | None = None,
         # Real hardware via the lab's labgrid-coordinator
         coordinator: str | None = None,
@@ -237,7 +279,11 @@ class LabgridAgent:
             poll_interval: Seconds between API polls
             artifact_dir: Directory for downloaded artifacts
             default_timeout: Default test timeout in seconds
-            health_checks_dir: Directory with health check YAML configs (optional)
+            health_checks_dir: Directory with health check TOML files, one per
+                device (optional)
+            health_checks: [health_checks] table of the config file: health
+                checks for all platforms of the lab ({} = defaults), plain keys
+                are settings for all, sub-tables per-device settings
             health_state_file: JSON file to persist device health state
             coordinator: The lab's labgrid-coordinator (host:port). Enables real
                 hardware: platforms are discovered from the places' device
@@ -281,6 +327,7 @@ class LabgridAgent:
 
         # Health check configuration
         self.health_checks_dir = Path(health_checks_dir) if health_checks_dir else None
+        self.health_checks = health_checks  # None: only health_checks_dir
         self.health_state_file = Path(health_state_file) if health_state_file else None
 
         # Runtime state
@@ -292,6 +339,7 @@ class LabgridAgent:
         self._current_jobs: set[str] = set()
         self._busy_platforms: set[str] = set()
         self._health_configs: dict[str, HealthCheckConfig] = {}
+        self._health_defaults: dict[str, Any] = {}
         self._device_health: dict[str, DeviceHealth] = {}
 
     async def __aenter__(self) -> "LabgridAgent":
@@ -324,10 +372,12 @@ class LabgridAgent:
             logger.info(f"Platforms: {', '.join(self.platforms)}")
 
         # Load health check configs if directory provided
-        if self.health_checks_dir:
+        if self.health_checks_dir or self.health_checks is not None:
             self._load_health_configs()
             self._load_health_state()
-            logger.info(f"Health checks enabled: {len(self._health_configs)} device(s)")
+            scope = "all platforms" if self.health_checks is not None else \
+                f"{len(self._health_configs)} device(s)"
+            logger.info(f"Health checks enabled: {scope}")
 
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600))
 
@@ -418,18 +468,46 @@ class LabgridAgent:
 
     def _load_health_configs(self) -> None:
         """Load health check configurations from directory."""
+        """Load per-device health checks: [health_checks.<device>] tables,
+        then health_checks_dir/*.toml (a file overrides a table). Platforms
+        without one get the [health_checks] defaults (see _health_config)."""
         self._health_configs.clear()
-
-        if not self.health_checks_dir or not self.health_checks_dir.exists():
-            return
-
-        for yaml_file in self.health_checks_dir.glob("*.yaml"):
+        configs = []
+        defaults, devices = HealthCheckConfig.split_table(self.health_checks or {})
+        try:
+            HealthCheckConfig.from_dict("defaults", defaults)  # validate
+            self._health_defaults = defaults
+        except Exception as e:
+            logger.error(f"Invalid [health_checks] settings: {e}")
+            self._health_defaults = {}
+        for device, values in devices.items():
             try:
-                config = HealthCheckConfig.from_yaml(yaml_file)
-                self._health_configs[config.device] = config
-                logger.info(f"Loaded health check: {config.device} (every {config.frequency_hours}h)")
+                configs.append(HealthCheckConfig.from_dict(device, {**self._health_defaults, **values}))
             except Exception as e:
-                logger.error(f"Failed to load {yaml_file}: {e}")
+                logger.error(f"Invalid [health_checks.{device}] settings: {e}")
+
+        if self.health_checks_dir and self.health_checks_dir.exists():
+            if any(self.health_checks_dir.glob("*.yaml")):
+                logger.warning(f"Ignoring YAML files in {self.health_checks_dir}: "
+                               "health checks are TOML now")
+            for toml_file in sorted(self.health_checks_dir.glob("*.toml")):
+                try:
+                    configs.append(HealthCheckConfig.from_toml(toml_file))
+                except Exception as e:
+                    logger.error(f"Failed to load {toml_file}: {e}")
+
+        for config in configs:
+            self._health_configs[config.device] = config
+            state = f"every {config.frequency_hours}h" if config.enabled else "disabled"
+            logger.info(f"Loaded health check: {config.device} ({state})")
+
+    def _health_config(self, device: str) -> HealthCheckConfig | None:
+        """The device's health check: its own config, else (with a
+        [health_checks] table) the defaults; None if it has none or is disabled."""
+        config = self._health_configs.get(device)
+        if config is None and self.health_checks is not None:
+            config = HealthCheckConfig.from_dict(device, self._health_defaults)
+        return config if config and config.enabled else None
 
     def _load_health_state(self) -> None:
         """Load persisted health state."""
@@ -466,12 +544,20 @@ class LabgridAgent:
 
     async def _check_health(self) -> None:
         """Check which devices need health checks and run them."""
-        if not self._health_configs:
+        if not self._health_configs and self.health_checks is None:
             return
 
         now = datetime.now()
 
-        for device, config in self._health_configs.items():
+        # The lab's platforms (discovered or configured), plus devices with
+        # their own config when the lab has no platform list yet
+        devices = self.platforms or list(self._health_configs)
+        for device in devices:
+            if self._stopping:
+                return
+            config = self._health_config(device)
+            if not config:
+                continue
             health = self._device_health.get(device, DeviceHealth(device=device))
 
             # Check if health check is due
@@ -487,6 +573,14 @@ class LabgridAgent:
         """Run a health check for a device."""
         health = self._device_health.get(device, DeviceHealth(device=device))
         workdir = self.artifact_dir / f"health-{device}"
+
+        # Resolving the image is not the device's fault: on errors (target
+        # file, downloads.openwrt.org) keep its state and retry next poll
+        try:
+            firmware_url, sha256 = await self._golden_image(config)
+        except Exception as e:
+            logger.error(f"Health check for {device} skipped: no golden image: {e}")
+            return
 
         # Hardware: needs a free place; if busy, retry at the next poll
         lease = None
@@ -504,10 +598,7 @@ class LabgridAgent:
             extra_env = self._labgrid.env(lease) if lease else None
 
             firmware = await self._fetch_firmware(
-                config.golden_image["firmware"],
-                config.golden_image.get("sha256"),
-                self.artifact_dir / "firmware",
-            )
+                firmware_url, sha256, self.artifact_dir / "firmware")
 
             result = await self._run_pytest(
                 target_yaml=target_yaml,
@@ -546,6 +637,20 @@ class LabgridAgent:
 
         self._device_health[device] = health
         self._save_health_state()
+
+    async def _golden_image(self, config: HealthCheckConfig) -> tuple[str, str | None]:
+        """(firmware URL, sha256): explicit in the config, else the target
+        file's image in its healthcheck_version, the configured release or
+        the current stable release."""
+        if config.golden_image.get("firmware"):
+            return config.golden_image["firmware"], config.golden_image.get("sha256")
+        image = TargetImage.from_target_file(self.targets_dir / config.target)
+        release = image.release(config.release)
+        if not release:
+            release = (await self._fetch_json(VERSIONS_URL))["stable_version"]
+        url, sha256 = image.select(release, await self._fetch_json(image.profiles_url(release)))
+        logger.info(f"Golden image for {config.device}: {url}")
+        return url, sha256
 
     def is_device_healthy(self, device: str) -> bool:
         """Check if a device is healthy (good or unknown state)."""
@@ -1327,7 +1432,7 @@ def main() -> None:
     parser.add_argument("--poll-interval", "-p", type=int, help="Seconds between polls (default: 30)")
     parser.add_argument("--once", action="store_true", help="Poll once, wait for started jobs, exit")
     parser.add_argument("--health-checks-dir", "-c",
-                        help="Directory with health check YAML configs (enables health checks)")
+                        help="Directory with health check TOML files, one per device")
     parser.add_argument("--health-state-file", "-s", help="JSON file to persist device health state")
     parser.add_argument("--coordinator", help="The lab's labgrid-coordinator host:port (default: "
                                               "127.0.0.1:20408 or LG_COORDINATOR; '' for QEMU only)")
@@ -1387,6 +1492,7 @@ def main() -> None:
         poll_interval=int(settings["poll_interval"]),
         artifact_dir=settings["artifact_dir"],
         health_checks_dir=settings["health_checks_dir"],
+        health_checks=settings["health_checks"],
         health_state_file=settings["health_state_file"],
         coordinator=settings["coordinator"],
         labgrid_command=settings["labgrid_command"],

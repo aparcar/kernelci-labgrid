@@ -47,8 +47,8 @@ targets_dir = "openwrt-tests/targets"     # default: <tests_dir>/../targets
 # reserve_timeout = 60                     # seconds to wait for a free place
 # poll_interval = 30                       # seconds between polls
 # artifact_dir = "/var/lib/labgrid-agent/artifacts"   # default: a temp dir
-# health_checks_dir = "/etc/labgrid-agent/health_checks"
-# health_state_file = "/var/lib/labgrid-agent/health.json"
+# health_checks_dir = "/etc/labgrid-agent/health_checks"   # *.toml, one per device
+# health_state_file = "/var/lib/labgrid-agent/health.json"  # keeps results across restarts
 
 # Maestro (KernelCI) API, including the version prefix
 [api]
@@ -59,3 +59,13 @@ token = "<lab API token>"
 [storage]
 url = "https://files.example.org/"
 token = "<lab storage token>"
+
+# Health checks (optional): boot a known-good image on every platform each
+# frequency_hours; a device whose check fails takes no jobs until one passes.
+# The golden image comes from the target file (openwrt: section, see README).
+# [health_checks]
+# frequency_hours = 24
+# release = "25.12.5"          # unless the target pins healthcheck_version
+#
+# [health_checks.rpi-4]
+# enabled = false
