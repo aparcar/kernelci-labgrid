@@ -61,6 +61,12 @@ class TestResolveSettings:
         assert s["api_url"] == "https://api.kernelci.org/latest"
         assert s["pytest_command"] is None  # agent uses its own python -m pytest
         assert s["platforms"] == []
+        assert s["coordinator"] == "127.0.0.1:20408"
+
+    def test_empty_coordinator_disables_hardware(self, tmp_path):
+        path = tmp_path / "c.toml"
+        path.write_text('coordinator = ""\nplatforms = ["qemu_x86-64"]\n')
+        assert resolve_settings({}, config_path=path, environ={})["coordinator"] == ""
 
     def test_precedence(self, config, tmp_path):
         env_file = tmp_path / "lab.env"

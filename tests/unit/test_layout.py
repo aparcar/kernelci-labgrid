@@ -76,3 +76,20 @@ def test_selection_keeps_real_tests_subdir(tmp_path, layout):
     tests, _, _ = layout
     (tests / "tests").mkdir()
     assert make_agent(tmp_path, tests)._selection("tests/test_x.py") == ["tests/test_x.py"]
+
+
+def test_firmware_dirs_are_traversable(tmp_path, layout):
+    """labgrid symlinks staged firmware into the TFTP dir when the exporter is
+    local; the TFTP server's user must be able to follow it."""
+    import os
+    import tempfile
+
+    tests, _, _ = layout
+    artifacts = Path(tempfile.mkdtemp(prefix="kci-labgrid-", dir=tmp_path))  # 0700
+    agent = LabgridAgent(api_url="http://x/latest", api_token="t", lab_name="lab",
+                         tests_dir=tests, artifact_dir=artifacts)
+    fw = artifacts / "firmware" / "abc123"
+    fw.mkdir(parents=True)
+    agent._make_traversable(fw)
+    for d in (artifacts, artifacts / "firmware", fw):
+        assert os.stat(d).st_mode & 0o777 == 0o755

@@ -132,3 +132,21 @@ def test_device_is_the_place(agent):
     data = agent._node_data({"id": "job1", "data": {"platform": "openwrt_one"}})
     assert data["device"] == "labgrid-aparcar-openwrt_one"
     assert agent._node_data({"id": "job2", "data": {"platform": "qemu_x86-64"}})["device"] == "aparcar-qemu_x86-64"
+
+
+async def test_no_coordinator_needs_platforms(tmp_path):
+    agent = LabgridAgent(api_url="http://x/latest", api_token="t", lab_name="lab",
+                         tests_dir=tmp_path, artifact_dir=tmp_path / "a")
+    with pytest.raises(RuntimeError, match="no platforms"):
+        await agent.start()
+
+
+async def test_no_coordinator_serves_exactly_configured(tmp_path):
+    agent = LabgridAgent(api_url="http://x/latest", api_token="t", lab_name="lab",
+                         tests_dir=tmp_path, artifact_dir=tmp_path / "a",
+                         platforms=["qemu_x86-64"], coordinator="")
+    await agent.start()
+    try:
+        assert agent.platforms == ["qemu_x86-64"]
+    finally:
+        await agent.stop()
