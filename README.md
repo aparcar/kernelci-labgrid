@@ -28,7 +28,7 @@ A single daemon that connects your Labgrid test lab to KernelCI. Runs locally in
 │  │  1. run due health checks (local, gate job execution)      │  │
 │  │  2. poll available jobs for this lab's platforms, claim    │  │
 │  │  3. fetch job definition, download + verify firmware       │  │
-│  │  4. uv run pytest --lg-env targets/<platform>.yaml         │  │
+│  │  4. pytest --lg-env targets/<platform>.yaml                │  │
 │  │                   --firmware <image>                       │  │
 │  │  5. upload logs, submit test nodes + boot node             │  │
 │  └─────────────────────────────┬──────────────────────────────┘  │
@@ -50,12 +50,17 @@ A single daemon that connects your Labgrid test lab to KernelCI. Runs locally in
 
 ## Requirements
 
-- Python 3.10+
-- Your existing test repository (e.g., openwrt-tests) with:
-  - pytest tests in `tests/`
-  - labgrid target YAMLs in `targets/` (one per platform)
-  - a `uv` project at its root (the agent runs `uv run pytest` there by default)
-- A KernelCI (Maestro) API user in group `runtime:<lab-name>:node-editor`
+- Python 3.10+ (the agent brings labgrid, pytest, pytest-check and pytest-harvest)
+- A test suite, e.g. from openwrt-tests, in three directories that can live
+  anywhere:
+  - `tests_dir`: pytest tests incl. `conftest.py`; pytest runs there
+  - `targets_dir`: labgrid target YAMLs, one per platform
+  - `strategies_dir`: labgrid strategies the targets import as
+    `../strategies/<file>.py` (default: `<targets_dir>/../strategies`). The
+    agent stages symlinks per run, so the imports resolve wherever the
+    directories are.
+- A KernelCI (Maestro) API user in group `runtime:<lab-name>:node-editor`,
+  plus `runtime:<pool>:node-editor` when taking jobs from a shared pool
 - Optional: a kernelci-storage token allowed to upload below `logs/<lab-name>/`
 
 ## Installation
@@ -104,8 +109,9 @@ labgrid-agent \
 | Option | Description |
 |--------|-------------|
 | `--lab-name`, `-l` | Lab name, matched against the job's `data.runtime` (or `LAB_NAME`) |
-| `--tests-dir`, `-t` | Path to your pytest tests directory; its parent is the repo pytest runs in |
-| `--targets-dir` | Path to labgrid target YAMLs (default: tests/../targets) |
+| `--tests-dir`, `-t` | pytest tests incl. `conftest.py`; pytest runs there |
+| `--targets-dir` | labgrid target YAMLs (default: `<tests_dir>/../targets`) |
+| `--strategies-dir` | labgrid strategies imported by the targets (default: `<targets_dir>/../strategies`) |
 | `--platform` | Platform this lab serves (`targets/<name>.yaml`), repeatable; default: all targets |
 | `--api-url` | API URL including version, e.g. `http://localhost:8001/latest` (or `KCI_API_URL`) |
 | `--api-token` | Lab API token (or `LAB_API_TOKEN` / `KCI_API_TOKEN`) |
@@ -113,7 +119,10 @@ labgrid-agent \
 | `--config` | TOML config file (see above) |
 | `--show-config` | Print the effective settings and exit |
 | `--env-file` | Read the settings above from a KEY=VALUE file |
-| `--pytest-command` | How to run pytest in the tests repo (default: `uv run pytest`) |
+| `--pytest-command` | How to run pytest in `tests_dir` (default: `python -m pytest` of the agent's environment) |
+| `--pool` | Shared runtime to also take jobs from, e.g. `openwrt-labs` (or `LAB_POOL`) |
+| `--coordinator` | The lab's labgrid-coordinator, enables real hardware (or `LG_COORDINATOR`) |
+| `--reserve-timeout` | Seconds to wait for a free place before leaving a job (default: 60) |
 | `--poll-interval`, `-p` | Seconds between polls (default: 30) |
 | `--once` | Poll once, wait for started jobs, exit |
 | `--artifact-dir`, `-a` | Where to download firmware and keep job outputs |
@@ -125,16 +134,22 @@ labgrid-agent \
 
 1. **Checks health** - runs scheduled health checks if due (results stay local)
 2. **Polls** `GET /nodes?kind=job&state=available&data.runtime=<lab>&data.platform=<p>`
-   for each healthy platform, one job per platform at a time
-3. **Claims the job** by writing `data.job_id=<lab>:<uuid>` (best effort, like
+   for each healthy platform, one job per platform at a time; with `pool` set,
+   then also `data.runtime=<pool>`. A pool lets several labs offering the same
+   device share jobs: each job runs once, in whichever lab claims it first.
+3. **Claims the job** by writing `data.job_id=<lab>:<uuid>` (pool jobs also get
+   `data.runtime=<lab>`, `data.pool=<pool>`), then re-reads it after a random
+   0.5-2 s and backs off if another lab's claim overwrote it (best effort, like
    kernelci/pullab_cloud, until kernelci-api has an atomic claim)
 4. **Fetches the job definition** from `artifacts.job_definition`, downloads the
    firmware and verifies its sha256
-5. **Runs pytest** in the tests repo:
+5. **Runs pytest** in `tests_dir`, with the agent's own Python:
    ```bash
-   uv run pytest <tests> --lg-env targets/<platform>.yaml --firmware <image> \
-       --lg-log=<out> --junit-xml=<out>/results.xml
+   python -m pytest <selection> --lg-env <run>/env/targets/<platform>.yaml \
+       --firmware <image> --lg-log=<out> --junit-xml=<out>/results.xml
    ```
+   `<run>/env/targets/<platform>.yaml` is a symlink to the target file next to
+   `<run>/env/strategies` → `strategies_dir`.
 6. **Uploads** console log, pytest log and JUnit XML to kernelci-storage
 7. **Reports back** with `PUT /nodes/<job>`: the job node plus one child per test
    module and one leaf per test (paths `…/openwrt-tests/<module>/<test>`), and
@@ -143,6 +158,36 @@ labgrid-agent \
 Failures where tests never ran (download, crash, timeout) mark the job
 `incomplete` with `error_code: Infrastructure`. Firmware that never reaches a
 shell (pytest exit code 3) is a real `fail`, not an infrastructure error.
+
+Ctrl-C (SIGINT/SIGTERM) stops right away: running jobs are cancelled (pytest
+and QEMU killed, the place powered off and unlocked) and given back to the
+queue, pool jobs to the pool, so another lab or the next run picks them up.
+A second Ctrl-C kills the test processes and exits immediately, leaving
+places locked.
+
+## Real hardware (labgrid)
+
+Each lab runs its own labgrid-coordinator; the agent runs in the lab next to
+it and only needs outbound HTTPS to the KernelCI instance. With
+`coordinator` set (or `LG_COORDINATOR`):
+
+- **Platforms** are the `device=<platform>` tags of the coordinator's places
+  (openwrt-tests sets them from `labnet.yaml`). `platforms` in the config
+  restricts that list and adds local QEMU targets.
+- **Before claiming** a job for a hardware platform, the agent reserves a place
+  with `device=<platform>` and locks it. If no place is free within
+  `reserve_timeout` (someone is debugging on the board), the job stays
+  available for later or for another lab.
+- **pytest** runs with `LG_COORDINATOR`, `LG_PLACE=<place>` and
+  `LG_IMAGE=<firmware>`, exactly like a manual openwrt-tests run. The
+  reservation is kept alive while the job runs.
+- **Afterwards** the board is powered off (`labgrid-client power off`), the
+  place unlocked and the reservation cancelled, also on errors and timeouts.
+- The job's `data.device` is the place name, so results show which board ran.
+
+Targets without `RemotePlace` (the `qemu_*` ones) run locally without a
+place. The agent talks to the coordinator through labgrid's own client
+library, pinned to the same labgrid as openwrt-tests.
 
 ## Health Checks
 
@@ -202,12 +247,14 @@ The job definition it points to (PULL_LABS-shaped, plus a firmware artifact):
 {
   "artifacts": {"firmware": "http://storage/openwrt/releases/25.12.5/armsr/armv8/openwrt-...-initramfs-kernel.bin"},
   "integrity": {"sha256": {"firmware": "f510b0c7..."}},
-  "tests": [{"id": "openwrt-tests", "type": "pytest", "parameters": "tests/", "timeout_s": 1800}],
+  "tests": [{"id": "openwrt-tests", "type": "pytest", "parameters": "", "timeout_s": 1800}],
   "environment": {"platform": "qemu_armsr-armv8", "arch": "aarch64_generic", "requirements": ["wan_port"]}
 }
 ```
 
-`parameters` is the pytest selection, relative to the tests repo.
+`parameters` is the pytest selection relative to `tests_dir`, e.g.
+`test_base.py::test_shell`; empty runs all tests. A leading `tests/` (from jobs
+created for the openwrt-tests repository layout) is stripped.
 
 ## Systemd Service
 

@@ -14,7 +14,8 @@ Job protocol (see openwrtci/plan.md):
                 artifacts.job_definition=<URL of a PULL_LABS-shaped JSON>
   definition    {"artifacts": {"firmware": URL},
                  "integrity": {"sha256": {"firmware": HEX}},
-                 "tests": [{"parameters": "tests/", "timeout_s": 1800}]}
+                 "tests": [{"parameters": "", "timeout_s": 1800}]}
+                (parameters: pytest selection relative to tests_dir, empty = all)
   claim         data.job_id=<lab>:<uuid> (best effort, kernelci-api has no
                 compare-and-set yet)
   results       PUT /nodes/<job> with the job node + one child per test
@@ -25,14 +26,16 @@ Job protocol (see openwrtci/plan.md):
 from __future__ import annotations
 
 import asyncio
+import random
 import hashlib
 import json
 import logging
-import os
 import shlex
 import shutil
+import os
 import signal
 import socket
+import sys
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
@@ -43,6 +46,16 @@ from typing import Any
 
 import aiohttp
 import yaml
+
+from kernelci_labgrid.labgrid import (
+    Coordinator,
+    Lease,
+    Place,
+    child_env,
+    kill_all,
+    kill_group,
+    spawn,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +156,7 @@ class HealthCheckConfig:
     target: str  # labgrid target YAML filename
     frequency_hours: int = 24
     golden_image: dict[str, str] = field(default_factory=dict)
-    test_path: str = ""  # pytest selection relative to the tests repo, empty = tests/
+    test_path: str = ""  # pytest selection relative to tests_dir, empty = all
     timeout: int = 3600
 
     @classmethod
@@ -192,13 +205,19 @@ class LabgridAgent:
         storage_url: str | None = None,
         storage_token: str | None = None,
         platforms: list[str] | None = None,
-        pytest_command: str = "uv run pytest",
+        pytest_command: str | None = None,
         poll_interval: int = 30,
         artifact_dir: str | Path | None = None,
         default_timeout: int = 3600,
         # Health check options
         health_checks_dir: str | Path | None = None,
         health_state_file: str | Path | None = None,
+        # Real hardware via the lab's labgrid-coordinator
+        coordinator: str | None = None,
+        labgrid_command: str | None = None,
+        pool: str | None = None,
+        strategies_dir: str | Path | None = None,
+        reserve_timeout: int = 60,
     ):
         """Initialize the agent.
 
@@ -206,30 +225,55 @@ class LabgridAgent:
             api_url: KernelCI API URL including the version, e.g. .../latest
             api_token: API token of the lab user (runtime:<lab>:node-editor)
             lab_name: Name of this lab, matched against the job's data.runtime
-            tests_dir: Path to test directory (e.g., openwrt-tests/tests);
-                its parent is the repo pytest runs in
-            targets_dir: Path to labgrid target YAMLs (e.g., openwrt-tests/targets)
+            tests_dir: pytest tests incl. conftest.py (e.g. openwrt-tests/tests);
+                pytest runs there
+            targets_dir: labgrid target YAMLs (default: tests_dir/../targets)
             storage_url: kernelci-storage URL for log uploads (optional)
             storage_token: kernelci-storage JWT with upload rights below
                 logs/<lab_name>/
             platforms: Platforms this lab serves; default: every target YAML
-            pytest_command: Command used to run pytest inside the tests repo
+            pytest_command: Command to run pytest (default: `python -m pytest`
+                with this environment's Python, which includes labgrid)
             poll_interval: Seconds between API polls
             artifact_dir: Directory for downloaded artifacts
             default_timeout: Default test timeout in seconds
             health_checks_dir: Directory with health check YAML configs (optional)
             health_state_file: JSON file to persist device health state
+            coordinator: The lab's labgrid-coordinator (host:port). Enables real
+                hardware: platforms are discovered from the places' device
+                tags, places are reserved per job. Without it: QEMU only.
+            labgrid_command: labgrid-client command, used for power off
+                (default: the labgrid-client of this environment)
+            strategies_dir: labgrid strategies the target files import as
+                `../strategies/<file>.py` (default: targets_dir/../strategies)
+            reserve_timeout: Seconds to wait for a free place before leaving
+                a job for later
+            pool: Shared runtime that several labs take jobs from (jobs for
+                any lab offering the platform); claiming moves a job to this lab
         """
         self.api_url = api_url.rstrip("/")
         self.api_token = api_token
         self.lab_name = lab_name
         self.tests_dir = Path(tests_dir)
-        self.tests_repo = self.tests_dir.parent
-        self.targets_dir = Path(targets_dir) if targets_dir else self.tests_repo / "targets"
+        self.targets_dir = Path(targets_dir) if targets_dir else self.tests_dir.parent / "targets"
+        self.strategies_dir = (Path(strategies_dir) if strategies_dir
+                               else self.targets_dir.parent / "strategies")
         self.storage_url = storage_url.rstrip("/") if storage_url else None
         self.storage_token = storage_token
-        self.platforms = list(platforms or [])
-        self.pytest_command = shlex.split(pytest_command)
+        # Configured platforms: an allow-list for discovered hardware
+        # platforms, plus the local (QEMU) platforms to run
+        self.configured_platforms = list(platforms or [])
+        self.platforms = list(self.configured_platforms)
+        self.reserve_timeout = reserve_timeout
+        self.pool = pool or None
+        if not labgrid_command:
+            labgrid_command = shlex.join([str(Path(sys.executable).parent / "labgrid-client")])
+        self._labgrid = (Coordinator(coordinator, labgrid_command, self.tests_dir)
+                         if coordinator else None)
+        self._places: list[Place] = []
+        self._job_places: dict[str, str] = {}
+        self.pytest_command = (shlex.split(pytest_command) if pytest_command
+                               else [sys.executable, "-m", "pytest"])
         self.poll_interval = poll_interval
         self.artifact_dir = Path(artifact_dir or tempfile.mkdtemp(prefix="kci-labgrid-"))
         self.default_timeout = default_timeout
@@ -242,6 +286,9 @@ class LabgridAgent:
         # Runtime state
         self._session: aiohttp.ClientSession | None = None
         self._running = False
+        self._stopping = False
+        self._stop_event = asyncio.Event()
+        self._job_tasks: set[asyncio.Task] = set()
         self._current_jobs: set[str] = set()
         self._busy_platforms: set[str] = set()
         self._health_configs: dict[str, HealthCheckConfig] = {}
@@ -259,12 +306,22 @@ class LabgridAgent:
         logger.info(f"Starting agent for lab: {self.lab_name}")
         logger.info(f"Tests directory: {self.tests_dir}")
         logger.info(f"Targets directory: {self.targets_dir}")
+        logger.info(f"Strategies directory: {self.strategies_dir}"
+                    f"{'' if self.strategies_dir.is_dir() else ' (missing)'}")
 
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
 
-        if not self.platforms:
-            self.platforms = sorted(p.stem for p in self.targets_dir.glob("*.yaml"))
-        logger.info(f"Platforms: {', '.join(self.platforms)}")
+        if self._labgrid:
+            logger.info(f"labgrid coordinator: {self._labgrid.address}")
+            await self._refresh_platforms()
+        else:
+            # QEMU-only lab: exactly the configured platforms
+            logger.info("No labgrid coordinator: local (QEMU) platforms only")
+            if not self.platforms:
+                raise RuntimeError("No coordinator and no platforms configured: set "
+                                   "`coordinator` for real hardware or `platforms` for QEMU")
+            # (with a coordinator, _refresh_platforms logs the list)
+            logger.info(f"Platforms: {', '.join(self.platforms)}")
 
         # Load health check configs if directory provided
         if self.health_checks_dir:
@@ -277,25 +334,52 @@ class LabgridAgent:
         self._running = True
         logger.info("Agent started")
 
+    def request_stop(self) -> None:
+        """Signal handler: stop polling and cancel running jobs (they go back
+        to the queue). A second call kills everything and exits at once."""
+        if self._stopping:
+            logger.warning("Aborting: killing test processes, places stay locked")
+            kill_all()
+            os._exit(130)
+        self._stopping = True
+        logger.info("Stopping: cancelling running jobs (press Ctrl-C again to abort)")
+        self._running = False
+        self._stop_event.set()
+        if self._labgrid:
+            self._labgrid.stopping = True
+        for task in self._job_tasks:
+            task.cancel()
+
+    async def _sleep(self, seconds: float) -> None:
+        """Sleep, but wake up when the agent is stopped."""
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+
     async def stop(self) -> None:
-        """Stop the agent."""
+        """Stop the agent: cancel running jobs, close connections."""
         logger.info("Stopping agent")
         self._running = False
 
         # Save health state
         self._save_health_state()
 
-        # Wait for current jobs
-        if self._current_jobs:
-            logger.info(f"Waiting for {len(self._current_jobs)} jobs...")
-            for _ in range(60):
-                if not self._current_jobs:
-                    break
-                await asyncio.sleep(1)
+        # Running jobs are cancelled and requeued; this waits for their
+        # cleanup (kill pytest, power off, unlock the place)
+        tasks = list(self._job_tasks)
+        if tasks:
+            logger.info(f"Cancelling {len(tasks)} running job(s)...")
+            for task in tasks:
+                task.cancel()
+            await asyncio.wait(tasks, timeout=120)
 
         if self._session:
             await self._session.close()
             self._session = None
+
+        if self._labgrid:
+            await self._labgrid.close()
 
         logger.info("Agent stopped")
 
@@ -321,11 +405,11 @@ class LabgridAgent:
                 logger.exception(f"Loop error: {e}")
 
             if once:
-                while self._current_jobs:
-                    await asyncio.sleep(1)
+                while self._current_jobs and self._running:
+                    await self._sleep(1)
                 break
 
-            await asyncio.sleep(self.poll_interval)
+            await self._sleep(self.poll_interval)
 
     # ==================== Health Check Methods ====================
     #
@@ -404,10 +488,20 @@ class LabgridAgent:
         health = self._device_health.get(device, DeviceHealth(device=device))
         workdir = self.artifact_dir / f"health-{device}"
 
+        # Hardware: needs a free place; if busy, retry at the next poll
+        lease = None
+        if self._is_remote(device):
+            lease = await self._reserve(device)
+            if not lease:
+                logger.info(f"Health check for {device} postponed: no free place")
+                return
+
         try:
             target_yaml = self.targets_dir / config.target
             if not target_yaml.exists():
                 raise RuntimeError(f"Target not found: {target_yaml}")
+
+            extra_env = self._labgrid.env(lease) if lease else None
 
             firmware = await self._fetch_firmware(
                 config.golden_image["firmware"],
@@ -418,9 +512,10 @@ class LabgridAgent:
             result = await self._run_pytest(
                 target_yaml=target_yaml,
                 firmware=firmware,
-                pytest_args=config.test_path or "tests/",
+                pytest_args=config.test_path,
                 timeout=config.timeout,
                 outdir=workdir,
+                extra_env=extra_env,
             )
 
             # Update health state
@@ -444,6 +539,10 @@ class LabgridAgent:
             health.failure_count += 1
             health.failure_reason = str(e)
             logger.exception(f"Health check error for {device}")
+
+        finally:
+            if lease:
+                await self._labgrid.release(lease)
 
         self._device_health[device] = health
         self._save_health_state()
@@ -495,9 +594,44 @@ class LabgridAgent:
 
     # ==================== Job Processing ====================
 
+    def _is_remote(self, platform: str) -> bool:
+        """Hardware target (labgrid RemotePlace) or local (QEMU)?"""
+        target = self._find_target_yaml(platform)
+        return bool(target) and "RemotePlace" in target.read_text()
+
+    async def _refresh_platforms(self) -> None:
+        """Hardware platforms = device tags of the coordinator's places.
+
+        Configured platforms restrict the hardware list and add local (QEMU)
+        targets. On coordinator errors the previous list is kept.
+        """
+        try:
+            self._places = await self._labgrid.places()
+        except Exception as e:
+            logger.error(f"Cannot list labgrid places: {e}")
+            return
+        hardware = {p.device for p in self._places if p.device}
+        missing = sorted(d for d in hardware if not self._find_target_yaml(d))
+        if missing:
+            logger.debug(f"Places without a target file: {', '.join(missing)}")
+        hardware = {d for d in hardware if d not in missing}
+        if self.configured_platforms:
+            hardware &= set(self.configured_platforms)
+        local = {p for p in self.configured_platforms
+                 if self._find_target_yaml(p) and not self._is_remote(p)}
+        platforms = sorted(hardware | local)
+        if platforms != self.platforms:
+            logger.info(f"Platforms: {', '.join(platforms) or '-'}")
+        self.platforms = platforms
+
     async def _poll_and_execute(self) -> None:
         """Poll for available jobs of our platforms and execute them."""
+        if self._labgrid:
+            await self._refresh_platforms()
+
         for platform in self.platforms:
+            if self._stopping:
+                break
             if platform in self._busy_platforms:
                 continue
 
@@ -507,31 +641,68 @@ class LabgridAgent:
                 logger.debug(f"Skipping {platform}: device unhealthy")
                 continue
 
-            try:
-                response = await self._api_get(
-                    "/nodes",
-                    kind="job",
-                    state="available",
-                    limit=10,
-                    **{"data.runtime": self.lab_name, "data.platform": platform},
-                )
-            except Exception as e:
-                logger.error(f"Failed to get jobs for {platform}: {e}")
+            # Jobs pinned to this lab first, then jobs in the shared pool
+            jobs = []
+            for runtime in (self.lab_name, self.pool):
+                if not runtime:
+                    continue
+                try:
+                    response = await self._api_get(
+                        "/nodes",
+                        kind="job",
+                        state="available",
+                        limit=10,
+                        **{"data.runtime": runtime, "data.platform": platform},
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to get {runtime} jobs for {platform}: {e}")
+                    continue
+                jobs += [j for j in response.get("items", [])
+                         if j.get("id") and j["id"] not in self._current_jobs
+                         and not (j.get("data") or {}).get("job_id")]
+            if not jobs:
                 continue
 
-            for job in response.get("items", []):
-                node_id = job.get("id")
-                if not node_id or node_id in self._current_jobs:
+            # Hardware: hold a place before claiming, so a job is only taken
+            # when it can run; otherwise it stays available for later
+            lease = None
+            if self._is_remote(platform):
+                lease = await self._reserve(platform)
+                if not lease:
                     continue
 
+            for job in jobs:
+                if self._stopping:
+                    break
                 claimed = await self._claim(job)
                 if not claimed:
                     continue
-
-                self._current_jobs.add(node_id)
+                if self._stopping:  # stopped while claiming
+                    await self._unclaim(claimed)
+                    break
+                self._current_jobs.add(claimed["id"])
                 self._busy_platforms.add(platform)
-                asyncio.create_task(self._execute_job(claimed))
+                task = asyncio.create_task(self._execute_job(claimed, lease))
+                self._job_tasks.add(task)
+                task.add_done_callback(self._job_tasks.discard)
                 break  # one job per platform at a time
+            else:
+                if lease:
+                    await self._labgrid.release(lease)
+
+    async def _reserve(self, platform: str) -> Lease | None:
+        """Reserve and lock a free place for a hardware platform, or None."""
+        if not self._labgrid:
+            logger.warning(f"{platform} needs a labgrid place, but no coordinator is configured")
+            return None
+        if not any(p.free for p in self._places if p.device == platform):
+            logger.debug(f"No free place for {platform}")
+            return None
+        try:
+            return await self._labgrid.reserve(platform, self.reserve_timeout)
+        except Exception as e:
+            logger.error(f"Reserving a place for {platform} failed: {e}")
+            return None
 
     async def _claim(self, job: dict[str, Any]) -> dict[str, Any] | None:
         """Claim a job by writing data.job_id.
@@ -553,19 +724,39 @@ class LabgridAgent:
             logger.debug(f"Job {node_id} already claimed: {current['data']['job_id']}")
             return None
 
-        current.setdefault("data", {})["job_id"] = f"{self.lab_name}:{uuid.uuid4().hex}"
-        current["data"]["worker"] = self.worker_id
+        claim_id = f"{self.lab_name}:{uuid.uuid4().hex}"
+        data = current.setdefault("data", {})
+        if self.pool and data.get("runtime") == self.pool:
+            # Take the job out of the shared pool: from now on it belongs to
+            # this lab (and only this lab may update it)
+            data["pool"] = self.pool
+            data["runtime"] = self.lab_name
+        data["job_id"] = claim_id
+        data["worker"] = self.worker_id
         try:
-            claimed = await self._api_put(f"/node/{node_id}", self._writable(current))
+            await self._api_put(f"/node/{node_id}", self._writable(current))
         except Exception as e:
             logger.warning(f"Failed to claim job {node_id}: {e}")
             return None
 
-        logger.info(f"Claimed {current.get('name')} ({node_id}) for {current['data'].get('platform')}")
+        # No compare-and-set in kernelci-api: wait a moment, then check our
+        # claim survived. A lab that wrote after us wins, we back off.
+        await asyncio.sleep(random.uniform(0.5, 2.0))
+        try:
+            claimed = await self._api_get(f"/node/{node_id}")
+        except Exception as e:
+            logger.warning(f"Could not verify claim of {node_id}: {e}")
+            return None
+        if (claimed.get("data") or {}).get("job_id") != claim_id:
+            logger.info(f"Job {node_id} was claimed by another lab, backing off")
+            return None
+
+        source = f" from pool {self.pool}" if data.get("pool") else ""
+        logger.info(f"Claimed {current.get('name')} ({node_id}) for {data.get('platform')}{source}")
         return claimed
 
-    async def _execute_job(self, job: dict[str, Any]) -> None:
-        """Execute a test job."""
+    async def _execute_job(self, job: dict[str, Any], lease: Lease | None = None) -> None:
+        """Execute a test job (on a reserved, locked labgrid place if leased)."""
         node_id = job["id"]
         job_name = job.get("name", "unknown")
         platform = job.get("data", {}).get("platform", "")
@@ -578,6 +769,11 @@ class LabgridAgent:
             if not target_yaml:
                 raise RuntimeError(f"No target YAML found for platform: {platform}")
 
+            extra_env = None
+            if lease:
+                self._job_places[node_id] = lease.place
+                extra_env = self._labgrid.env(lease)
+
             job_def = await self._fetch_json(job["artifacts"]["job_definition"])
             test = (job_def.get("tests") or [{}])[0]
             firmware = await self._fetch_firmware(
@@ -589,9 +785,10 @@ class LabgridAgent:
             result = await self._run_pytest(
                 target_yaml=target_yaml,
                 firmware=firmware,
-                pytest_args=test.get("parameters", "tests/"),
+                pytest_args=test.get("parameters", ""),
                 timeout=test.get("timeout_s", self.default_timeout),
                 outdir=outdir,
+                extra_env=extra_env,
             )
 
             await self._report_results(job, result)
@@ -600,11 +797,19 @@ class LabgridAgent:
                         f"({result.passed} passed, {result.failed} failed, "
                         f"{result.skipped} skipped)")
 
+        except asyncio.CancelledError:
+            logger.info(f"Cancelled {job_name} ({node_id}), returning it to the queue")
+            await self._unclaim(job)
+            raise
+
         except Exception as e:
             logger.exception(f"Job failed: {job_name}")
             await self._report_failure(job, str(e), outdir)
 
         finally:
+            if lease:
+                await self._labgrid.release(lease)
+            self._job_places.pop(node_id, None)
             self._current_jobs.discard(node_id)
             self._busy_platforms.discard(platform)
 
@@ -627,6 +832,7 @@ class LabgridAgent:
         # every build, a name-only cache would serve a stale image.
         dest_dir = dest_dir / (sha256[:16] if sha256 else "unverified")
         dest_dir.mkdir(parents=True, exist_ok=True)
+        self._make_traversable(dest_dir)
         path = dest_dir / url.rsplit("/", 1)[-1]
 
         if not path.exists():
@@ -660,7 +866,18 @@ class LabgridAgent:
                     raise RuntimeError(f"Failed to unpack {path.name}")
             path = unpacked
 
+        # labgrid stages firmware for TFTP by symlinking it when the exporter
+        # is on this host, so the TFTP server's user must be able to read it
+        path.chmod(0o644)
         return path
+
+    def _make_traversable(self, directory: Path) -> None:
+        """chmod 0755 from artifact_dir down to `directory` (mkdtemp is 0700)."""
+        directory = directory.resolve()
+        root = self.artifact_dir.resolve()
+        chain = [directory, *directory.parents]
+        for d in chain[: chain.index(root) + 1] if root in chain else [directory]:
+            d.chmod(0o755)
 
     @staticmethod
     def _sha256(path: Path) -> str:
@@ -726,6 +943,38 @@ class LabgridAgent:
 
         return None
 
+    def _selection(self, pytest_args: str) -> list[str]:
+        """Job selection relative to tests_dir; empty = all tests.
+
+        Jobs created against the openwrt-tests repo layout say `tests/...`;
+        strip that prefix when tests_dir itself has no tests/ subdirectory.
+        """
+        args = shlex.split(pytest_args or "")
+        if not (self.tests_dir / "tests").is_dir():
+            args = [a[len("tests/"):] if a.startswith("tests/") else a for a in args]
+            args = [a for a in args if a not in ("tests", "")]
+        return args or ["."]
+
+    def _stage_target(self, target_yaml: Path, stage: Path) -> Path:
+        """Symlink the target file and strategies into a per-run directory.
+
+        Target files import strategies relative to themselves
+        (`../strategies/tftpstrategy.py`), and labgrid resolves that against
+        the target file's path without resolving symlinks. So
+        <stage>/targets/<file> -> target and <stage>/strategies ->
+        strategies_dir let targets and strategies live anywhere.
+        """
+        targets = stage / "targets"
+        targets.mkdir(parents=True, exist_ok=True)
+        staged = targets / target_yaml.name
+        strategies = stage / "strategies"
+        for link, dest in ((staged, target_yaml.resolve()), (strategies, self.strategies_dir.resolve())):
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            if dest.exists():
+                link.symlink_to(dest)
+        return staged
+
     async def _run_pytest(
         self,
         target_yaml: Path,
@@ -733,6 +982,7 @@ class LabgridAgent:
         pytest_args: str,
         timeout: int,
         outdir: Path,
+        extra_env: dict[str, str] | None = None,
     ) -> TestResult:
         """Run pytest with the labgrid environment in the tests repo."""
         outdir.mkdir(parents=True, exist_ok=True)
@@ -741,8 +991,8 @@ class LabgridAgent:
 
         cmd = [
             *self.pytest_command,
-            *shlex.split(pytest_args),
-            "--lg-env", str(target_yaml),
+            *self._selection(pytest_args),
+            "--lg-env", str(self._stage_target(target_yaml, outdir / "env")),
             "--firmware", str(firmware),
             f"--lg-log={outdir}",
             f"--junit-xml={junit_xml}",
@@ -752,27 +1002,35 @@ class LabgridAgent:
             "-p", "no:cacheprovider",
         ]
 
-        env = os.environ.copy()
+        env = child_env()
         env["LG_IMAGE"] = str(firmware)
+        env.update(extra_env or {})
 
         logger.info(f"Running: {shlex.join(cmd)}")
 
         returncode: int | None = None
         try:
             with pytest_log.open("wb") as log:
-                proc = await asyncio.create_subprocess_exec(
+                # Own process group: on timeout also stop QEMU and anything a
+                # wrapper like `uv run` started, so they don't hold the device
+                proc = await spawn(
                     *cmd,
                     stdout=log,
                     stderr=asyncio.subprocess.STDOUT,
-                    cwd=self.tests_repo,
+                    cwd=self.tests_dir,
                     env=env,
                 )
                 try:
                     returncode = await asyncio.wait_for(proc.wait(), timeout=timeout)
                 except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
+                    await kill_group(proc)
                     log.write(f"\nlabgrid-agent: timed out after {timeout}s\n".encode())
+                except asyncio.CancelledError:
+                    await kill_group(proc)
+                    log.write(b"\nlabgrid-agent: stopped\n")
+                    raise
+                else:
+                    await kill_group(proc)  # exited: just forget it
         except Exception as e:
             return TestResult(errors=1, output=str(e), outdir=outdir)
 
@@ -910,7 +1168,16 @@ class LabgridAgent:
         node["result"] = self._job_result(result)
         node["artifacts"] = {**(job.get("artifacts") or {}), **artifacts}
         node["data"] = {**(job.get("data") or {}), **node_data,
-                        "duration_ms": int(result.duration * 1000)}
+                        "duration_ms": int(result.duration * 1000),
+                        # lets dashboards show counts without fetching the tests
+                        "summary": {
+                            "total": result.total,
+                            "passed": result.passed,
+                            "failed": result.failed,
+                            "errors": result.errors,
+                            "skipped": result.skipped,
+                            "boot": result.boot_result,
+                        }}
         if result.returncode == PYTEST_RC_NO_SHELL:
             node["data"]["error_msg"] = "firmware did not reach a shell"
         elif node["result"] == "incomplete":
@@ -927,7 +1194,8 @@ class LabgridAgent:
             "runtime": self.lab_name,
             "platform": platform,
             "arch": data.get("arch"),
-            "device": f"{self.lab_name}-{platform}",
+            # the labgrid place for hardware, <lab>-<platform> for QEMU
+            "device": self._job_places.get(job.get("id"), f"{self.lab_name}-{platform}"),
         }
 
     @staticmethod
@@ -962,6 +1230,25 @@ class LabgridAgent:
                 "artifacts": boot_artifacts,
                 "data": self._node_data(job),
             })
+
+    async def _unclaim(self, job: dict[str, Any]) -> None:
+        """Give a claimed job back (agent stopped before finishing it): drop
+        our claim and return a pool job to the pool; never raises."""
+        node_id = job["id"]
+        claim_id = (job.get("data") or {}).get("job_id")
+        try:
+            current = await self._api_get(f"/node/{node_id}")
+            data = current.get("data") or {}
+            if current.get("state") != "available" or data.get("job_id") != claim_id:
+                return
+            data.pop("job_id", None)
+            data.pop("worker", None)
+            if data.get("pool"):
+                data["runtime"] = data.pop("pool")
+            current["data"] = data
+            await self._api_put(f"/node/{node_id}", self._writable(current))
+        except Exception as e:
+            logger.error(f"Failed to return job {node_id} to the queue: {e}")
 
     async def _report_failure(self, job: dict[str, Any], error: str,
                               outdir: Path | None = None) -> None:
@@ -1013,7 +1300,7 @@ def main() -> None:
         description="KernelCI Labgrid Agent - polls for jobs & runs health checks",
         epilog="Settings come from (later wins): a TOML config file, --env-file, "
                "environment variables (LAB_NAME, KCI_API_URL, LAB_API_TOKEN, "
-               "KCI_STORAGE_URL, LAB_STORAGE_TOKEN) and these options. The config "
+               "KCI_STORAGE_URL, LAB_STORAGE_TOKEN, LG_COORDINATOR) and these options. The config "
                "file is --config, $LABGRID_AGENT_CONFIG, ./labgrid-agent.toml, "
                "~/.config/labgrid-agent/config.toml or /etc/labgrid-agent/config.toml.",
     )
@@ -1026,20 +1313,29 @@ def main() -> None:
     parser.add_argument("--lab-name", "-l", help="Lab name, matched against the job's data.runtime")
     parser.add_argument("--tests-dir", "-t", help="Tests directory (e.g. openwrt-tests/tests)")
     parser.add_argument("--targets-dir", help="labgrid targets (default: tests_dir/../targets)")
+    parser.add_argument("--strategies-dir",
+                        help="labgrid strategies imported by the targets (default: targets_dir/../strategies)")
     parser.add_argument("--api-url", help="KernelCI API URL including version")
     parser.add_argument("--api-token", help="Lab API token")
     parser.add_argument("--storage-url", help="kernelci-storage URL for log uploads")
     parser.add_argument("--storage-token", help="kernelci-storage JWT")
     parser.add_argument("--platform", dest="platforms", action="append",
                         help="Platform served by this lab (targets/<name>.yaml); repeatable")
-    parser.add_argument("--pytest-command", help="Command to run pytest in the tests repo "
-                                                 "(default: 'uv run pytest')")
+    parser.add_argument("--pytest-command", help="Command to run pytest in tests_dir "
+                                                 "(default: python -m pytest of this environment)")
     parser.add_argument("--artifact-dir", "-a", help="Directory for firmware and job outputs")
     parser.add_argument("--poll-interval", "-p", type=int, help="Seconds between polls (default: 30)")
     parser.add_argument("--once", action="store_true", help="Poll once, wait for started jobs, exit")
     parser.add_argument("--health-checks-dir", "-c",
                         help="Directory with health check YAML configs (enables health checks)")
     parser.add_argument("--health-state-file", "-s", help="JSON file to persist device health state")
+    parser.add_argument("--coordinator", help="The lab's labgrid-coordinator host:port (default: "
+                                              "127.0.0.1:20408 or LG_COORDINATOR; '' for QEMU only)")
+    parser.add_argument("--labgrid-command", help="labgrid-client command for power off "
+                                                  "(default: labgrid-client of this environment)")
+    parser.add_argument("--pool", help="Shared runtime to also take jobs from (e.g. openwrt-labs)")
+    parser.add_argument("--reserve-timeout", type=int,
+                        help="Seconds to wait for a free place before leaving a job (default: 60)")
     parser.add_argument("--debug", "-d", action="store_true", help="Debug logging")
 
     args = parser.parse_args()
@@ -1066,6 +1362,10 @@ def main() -> None:
         if not settings[key]:
             parser.error(f"{key} required ({hint})")
 
+    if not settings["coordinator"] and not settings["platforms"]:
+        parser.error("no coordinator and no platforms: set `coordinator` (real hardware) "
+                     "or `platforms` (QEMU-only lab, with coordinator = \"\")")
+
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -1079,6 +1379,7 @@ def main() -> None:
         lab_name=settings["lab_name"],
         tests_dir=Path(settings["tests_dir"]).resolve(),
         targets_dir=settings["targets_dir"],
+        strategies_dir=settings["strategies_dir"],
         storage_url=settings["storage_url"],
         storage_token=settings["storage_token"],
         platforms=settings["platforms"],
@@ -1087,12 +1388,16 @@ def main() -> None:
         artifact_dir=settings["artifact_dir"],
         health_checks_dir=settings["health_checks_dir"],
         health_state_file=settings["health_state_file"],
+        coordinator=settings["coordinator"],
+        labgrid_command=settings["labgrid_command"],
+        reserve_timeout=int(settings["reserve_timeout"]),
+        pool=settings["pool"],
     )
 
     # Signal handling
     loop = asyncio.new_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(agent.stop()))
+        loop.add_signal_handler(sig, agent.request_stop)
 
     try:
         loop.run_until_complete(agent.run(once=args.once))

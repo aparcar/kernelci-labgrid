@@ -59,8 +59,21 @@ class TestResolveSettings:
     def test_defaults(self):
         s = resolve_settings({}, environ={})
         assert s["api_url"] == "https://api.kernelci.org/latest"
-        assert s["pytest_command"] == "uv run pytest"
+        assert s["pytest_command"] is None  # agent uses its own python -m pytest
         assert s["platforms"] == []
+        assert s["coordinator"] == "127.0.0.1:20408"
+
+    def test_pool(self, tmp_path):
+        path = tmp_path / "c.toml"
+        path.write_text('pool = "openwrt-labs"\n')
+        assert resolve_settings({}, environ={})["pool"] is None
+        assert resolve_settings({}, config_path=path, environ={})["pool"] == "openwrt-labs"
+        assert resolve_settings({}, environ={"LAB_POOL": "x"})["pool"] == "x"
+
+    def test_empty_coordinator_disables_hardware(self, tmp_path):
+        path = tmp_path / "c.toml"
+        path.write_text('coordinator = ""\nplatforms = ["qemu_x86-64"]\n')
+        assert resolve_settings({}, config_path=path, environ={})["coordinator"] == ""
 
     def test_precedence(self, config, tmp_path):
         env_file = tmp_path / "lab.env"
@@ -107,3 +120,11 @@ def test_describe_masks_secrets(config):
     assert "api-secret-token" not in out
     assert "storage-secret-token" not in out
     assert "lynxis" in out
+
+
+def test_path_environment_beats_config(config):
+    """Container images point tests_dir etc. at their own layout."""
+    s = resolve_settings({}, config_path=config,
+                         environ={"LABGRID_TESTS_DIR": "/opt/openwrt-tests/tests"})
+    assert s["tests_dir"] == "/opt/openwrt-tests/tests"
+    assert s["lab_name"] == "lynxis"
