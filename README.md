@@ -59,7 +59,8 @@ A single daemon that connects your Labgrid test lab to KernelCI. Runs locally in
     `../strategies/<file>.py` (default: `<targets_dir>/../strategies`). The
     agent stages symlinks per run, so the imports resolve wherever the
     directories are.
-- A KernelCI (Maestro) API user in group `runtime:<lab-name>:node-editor`
+- A KernelCI (Maestro) API user in group `runtime:<lab-name>:node-editor`,
+  plus `runtime:<pool>:node-editor` when taking jobs from a shared pool
 - Optional: a kernelci-storage token allowed to upload below `logs/<lab-name>/`
 
 ## Installation
@@ -119,6 +120,7 @@ labgrid-agent \
 | `--show-config` | Print the effective settings and exit |
 | `--env-file` | Read the settings above from a KEY=VALUE file |
 | `--pytest-command` | How to run pytest in `tests_dir` (default: `python -m pytest` of the agent's environment) |
+| `--pool` | Shared runtime to also take jobs from, e.g. `openwrt-labs` (or `LAB_POOL`) |
 | `--coordinator` | The lab's labgrid-coordinator, enables real hardware (or `LG_COORDINATOR`) |
 | `--reserve-timeout` | Seconds to wait for a free place before leaving a job (default: 60) |
 | `--poll-interval`, `-p` | Seconds between polls (default: 30) |
@@ -132,8 +134,12 @@ labgrid-agent \
 
 1. **Checks health** - runs scheduled health checks if due (results stay local)
 2. **Polls** `GET /nodes?kind=job&state=available&data.runtime=<lab>&data.platform=<p>`
-   for each healthy platform, one job per platform at a time
-3. **Claims the job** by writing `data.job_id=<lab>:<uuid>` (best effort, like
+   for each healthy platform, one job per platform at a time; with `pool` set,
+   then also `data.runtime=<pool>`. A pool lets several labs offering the same
+   device share jobs: each job runs once, in whichever lab claims it first.
+3. **Claims the job** by writing `data.job_id=<lab>:<uuid>` (pool jobs also get
+   `data.runtime=<lab>`, `data.pool=<pool>`), then re-reads it after a random
+   0.5-2 s and backs off if another lab's claim overwrote it (best effort, like
    kernelci/pullab_cloud, until kernelci-api has an atomic claim)
 4. **Fetches the job definition** from `artifacts.job_definition`, downloads the
    firmware and verifies its sha256

@@ -26,6 +26,7 @@ Job protocol (see openwrtci/plan.md):
 from __future__ import annotations
 
 import asyncio
+import random
 import hashlib
 import json
 import logging
@@ -205,6 +206,7 @@ class LabgridAgent:
         # Real hardware via the lab's labgrid-coordinator
         coordinator: str | None = None,
         labgrid_command: str | None = None,
+        pool: str | None = None,
         strategies_dir: str | Path | None = None,
         reserve_timeout: int = 60,
     ):
@@ -237,6 +239,8 @@ class LabgridAgent:
                 `../strategies/<file>.py` (default: targets_dir/../strategies)
             reserve_timeout: Seconds to wait for a free place before leaving
                 a job for later
+            pool: Shared runtime that several labs take jobs from (jobs for
+                any lab offering the platform); claiming moves a job to this lab
         """
         self.api_url = api_url.rstrip("/")
         self.api_token = api_token
@@ -252,6 +256,7 @@ class LabgridAgent:
         self.configured_platforms = list(platforms or [])
         self.platforms = list(self.configured_platforms)
         self.reserve_timeout = reserve_timeout
+        self.pool = pool or None
         if not labgrid_command:
             labgrid_command = shlex.join([str(Path(sys.executable).parent / "labgrid-client")])
         self._labgrid = (Coordinator(coordinator, labgrid_command, self.tests_dir)
@@ -598,20 +603,25 @@ class LabgridAgent:
                 logger.debug(f"Skipping {platform}: device unhealthy")
                 continue
 
-            try:
-                response = await self._api_get(
-                    "/nodes",
-                    kind="job",
-                    state="available",
-                    limit=10,
-                    **{"data.runtime": self.lab_name, "data.platform": platform},
-                )
-            except Exception as e:
-                logger.error(f"Failed to get jobs for {platform}: {e}")
-                continue
-
-            jobs = [j for j in response.get("items", [])
-                    if j.get("id") and j["id"] not in self._current_jobs]
+            # Jobs pinned to this lab first, then jobs in the shared pool
+            jobs = []
+            for runtime in (self.lab_name, self.pool):
+                if not runtime:
+                    continue
+                try:
+                    response = await self._api_get(
+                        "/nodes",
+                        kind="job",
+                        state="available",
+                        limit=10,
+                        **{"data.runtime": runtime, "data.platform": platform},
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to get {runtime} jobs for {platform}: {e}")
+                    continue
+                jobs += [j for j in response.get("items", [])
+                         if j.get("id") and j["id"] not in self._current_jobs
+                         and not (j.get("data") or {}).get("job_id")]
             if not jobs:
                 continue
 
@@ -669,15 +679,35 @@ class LabgridAgent:
             logger.debug(f"Job {node_id} already claimed: {current['data']['job_id']}")
             return None
 
-        current.setdefault("data", {})["job_id"] = f"{self.lab_name}:{uuid.uuid4().hex}"
-        current["data"]["worker"] = self.worker_id
+        claim_id = f"{self.lab_name}:{uuid.uuid4().hex}"
+        data = current.setdefault("data", {})
+        if self.pool and data.get("runtime") == self.pool:
+            # Take the job out of the shared pool: from now on it belongs to
+            # this lab (and only this lab may update it)
+            data["pool"] = self.pool
+            data["runtime"] = self.lab_name
+        data["job_id"] = claim_id
+        data["worker"] = self.worker_id
         try:
-            claimed = await self._api_put(f"/node/{node_id}", self._writable(current))
+            await self._api_put(f"/node/{node_id}", self._writable(current))
         except Exception as e:
             logger.warning(f"Failed to claim job {node_id}: {e}")
             return None
 
-        logger.info(f"Claimed {current.get('name')} ({node_id}) for {current['data'].get('platform')}")
+        # No compare-and-set in kernelci-api: wait a moment, then check our
+        # claim survived. A lab that wrote after us wins, we back off.
+        await asyncio.sleep(random.uniform(0.5, 2.0))
+        try:
+            claimed = await self._api_get(f"/node/{node_id}")
+        except Exception as e:
+            logger.warning(f"Could not verify claim of {node_id}: {e}")
+            return None
+        if (claimed.get("data") or {}).get("job_id") != claim_id:
+            logger.info(f"Job {node_id} was claimed by another lab, backing off")
+            return None
+
+        source = f" from pool {self.pool}" if data.get("pool") else ""
+        logger.info(f"Claimed {current.get('name')} ({node_id}) for {data.get('platform')}{source}")
         return claimed
 
     async def _execute_job(self, job: dict[str, Any], lease: Lease | None = None) -> None:
@@ -1228,6 +1258,7 @@ def main() -> None:
                                               "127.0.0.1:20408 or LG_COORDINATOR; '' for QEMU only)")
     parser.add_argument("--labgrid-command", help="labgrid-client command for power off "
                                                   "(default: labgrid-client of this environment)")
+    parser.add_argument("--pool", help="Shared runtime to also take jobs from (e.g. openwrt-labs)")
     parser.add_argument("--reserve-timeout", type=int,
                         help="Seconds to wait for a free place before leaving a job (default: 60)")
     parser.add_argument("--debug", "-d", action="store_true", help="Debug logging")
@@ -1285,6 +1316,7 @@ def main() -> None:
         coordinator=settings["coordinator"],
         labgrid_command=settings["labgrid_command"],
         reserve_timeout=int(settings["reserve_timeout"]),
+        pool=settings["pool"],
     )
 
     # Signal handling
