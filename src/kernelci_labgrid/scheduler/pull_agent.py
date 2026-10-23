@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import hashlib
 import json
 import logging
@@ -1003,27 +1004,47 @@ class LabgridAgent:
         dest = f"logs/{self.lab_name}/{node_id}"
 
         for path, key in uploads:
-            if not path.exists():
-                continue
-            form = aiohttp.FormData()
-            form.add_field("path", dest)
-            form.add_field("file0", path.read_bytes(), filename=path.name)
-            try:
-                async with self._session.post(
-                    f"{self.storage_url}/v1/file",
-                    data=form,
-                    headers={"Authorization": f"Bearer {self.storage_token}"},
-                ) as resp:
-                    if resp.status not in (200, 201):
-                        raise RuntimeError(f"HTTP {resp.status} {await resp.text()}")
-                artifacts[key] = f"{self.storage_url}/{dest}/{path.name}"
-            except Exception as e:
-                logger.error(f"Failed to upload {path.name}: {e}")
+            if path.exists() and (url := await self._upload_file(path, dest)):
+                artifacts[key] = url
 
         # KCIDB takes the log excerpt from test_log; fall back to pytest output
         if "test_log" not in artifacts and "pytest_log" in artifacts:
             artifacts["test_log"] = artifacts["pytest_log"]
         return artifacts
+
+    async def _upload_test_logs(self, node_id: str, result: TestResult) -> None:
+        """Upload each test's own log (see _testcase_log) and set its
+        log_url, so a test node links to its part instead of the whole run."""
+        if not (self.storage_url and self.storage_token and self._session and result.outdir):
+            return
+        logdir = result.outdir / "tests"
+        logdir.mkdir(parents=True, exist_ok=True)
+        dest = f"logs/{self.lab_name}/{node_id}/tests"
+        for tc in result.test_cases:
+            if not tc.get("log"):
+                continue
+            name = re.sub(r"[^A-Za-z0-9._-]", "_", f"{tc['module']}.{tc['name']}")
+            path = logdir / f"{name}.log"
+            path.write_text(tc["log"] + "\n")
+            tc["log_url"] = await self._upload_file(path, dest)
+
+    async def _upload_file(self, path: Path, dest: str) -> str | None:
+        """Upload one file to kernelci-storage under dest; its URL or None."""
+        form = aiohttp.FormData()
+        form.add_field("path", dest)
+        form.add_field("file0", path.read_bytes(), filename=path.name)
+        try:
+            async with self._session.post(
+                f"{self.storage_url}/v1/file",
+                data=form,
+                headers={"Authorization": f"Bearer {self.storage_token}"},
+            ) as resp:
+                if resp.status not in (200, 201):
+                    raise RuntimeError(f"HTTP {resp.status} {await resp.text()}")
+            return f"{self.storage_url}/{dest}/{path.name}"
+        except Exception as e:
+            logger.error(f"Failed to upload {path.name}: {e}")
+            return None
 
     # ==================== Test Execution ====================
 
@@ -1101,6 +1122,9 @@ class LabgridAgent:
             "--firmware", str(firmware),
             f"--lg-log={outdir}",
             f"--junit-xml={junit_xml}",
+            # Each test's log records (its console lines) and output in the
+            # JUnit XML: the per-test logs
+            "-o", "junit_logging=all",
             "--log-cli-level=CONSOLE",
             "--tb=short",
             "-v",
@@ -1203,6 +1227,7 @@ class LabgridAgent:
                         "result": tc_result,
                         "duration": duration,
                         "message": message,
+                        "log": self._testcase_log(testcase),
                     })
 
             result.passed = result.total - result.failed - result.errors - result.skipped
@@ -1212,6 +1237,20 @@ class LabgridAgent:
             result.errors = 1
 
         return result
+
+    @staticmethod
+    def _testcase_log(testcase: ET.Element) -> str:
+        """A test's own log: captured output (junit_logging=all: its console
+        lines and log records), then the failure's traceback. Sections that
+        are only a "--- Captured Err ---" header are left out."""
+        sections = []
+        for tag in ("system-out", "system-err", "failure", "error"):
+            for element in testcase.findall(tag):
+                text = (element.text or "").strip("\n")
+                body = [line for line in text.splitlines() if not line.startswith("-----")]
+                if "".join(body).strip():
+                    sections.append(text)
+        return "\n\n".join(sections)
 
     @staticmethod
     def _module_name(classname: str) -> str:
@@ -1240,6 +1279,11 @@ class LabgridAgent:
         job_path = job["path"]
         node_data = self._node_data(job)
 
+        # The whole run's files, listed with each test next to its own log
+        run_files = {k: v for k, v in (("console_log", artifacts.get("test_log")),
+                                       ("pytest_log", artifacts.get("pytest_log")),
+                                       ("junit", artifacts.get("junit"))) if v}
+
         modules: dict[str, list[dict[str, Any]]] = {}
         for tc in result.test_cases:
             modules.setdefault(tc["module"], []).append(tc)
@@ -1257,6 +1301,8 @@ class LabgridAgent:
                     "path": job_path + [module, tc["name"]],
                     "state": "done",
                     "result": self._map_outcome(tc["result"]),
+                    # its own log; without one KCIDB shows the job's console
+                    "artifacts": {**run_files, "test_log": tc["log_url"]} if tc.get("log_url") else {},
                     "data": data,
                 }, "child_nodes": []})
             children.append({"node": {
@@ -1317,6 +1363,7 @@ class LabgridAgent:
         """Report test results to the KernelCI API."""
         node_id = job["id"]
         artifacts = await self._upload_logs(node_id, result.outdir) if result.outdir else {}
+        await self._upload_test_logs(node_id, result)
 
         hierarchy = self._build_hierarchy(job, result, artifacts)
         await self._api_put(f"/nodes/{node_id}", hierarchy)
