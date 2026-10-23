@@ -111,6 +111,8 @@ class TestBuildHierarchy:
         assert node["artifacts"]["job_definition"] == JOB["artifacts"]["job_definition"]
         assert node["artifacts"]["test_log"] == "http://storage/console"
         assert node["data"]["device"] == "openwrt-local-qemu_armsr-armv8"
+        assert node["data"]["summary"] == {
+            "total": 4, "passed": 2, "failed": 1, "errors": 0, "skipped": 1, "boot": "pass"}
 
         modules = {c["node"]["name"]: c for c in h["child_nodes"]}
         assert set(modules) == {"base", "lan", "wifi"}
@@ -125,6 +127,19 @@ class TestBuildHierarchy:
         assert ssh["result"] == "fail"
         assert ssh["data"]["error_msg"] == "timeout"
         assert ssh["data"]["duration_ms"] == 3000
+
+    def test_per_test_log(self, agent):
+        with_log = {**case("base", "test_shell", "pass"), "log_url": "http://storage/tests/base.test_shell.log"}
+        result = TestResult(passed=2, total=2, returncode=0,
+                            test_cases=[with_log, case("base", "test_ssh", "pass")])
+        h = agent._build_hierarchy(JOB, result, {"test_log": "http://storage/console",
+                                                 "junit": "http://storage/results.xml"})
+
+        shell, ssh = (c["node"] for c in h["child_nodes"][0]["child_nodes"])
+        assert shell["artifacts"] == {"test_log": "http://storage/tests/base.test_shell.log",
+                                      "console_log": "http://storage/console",
+                                      "junit": "http://storage/results.xml"}
+        assert ssh["artifacts"] == {}  # no log of its own: KCIDB uses the job's
 
     def test_infra_error_code(self, agent):
         h = agent._build_hierarchy(JOB, TestResult(returncode=2), {})
@@ -151,10 +166,12 @@ class TestClaim:
 
         async def fake_put(endpoint, data):
             calls["put"].append((endpoint, data))
+            state["node"] = dict(data, data=dict(data["data"]))
             return data
 
         monkeypatch.setattr(agent, "_api_get", fake_get)
         monkeypatch.setattr(agent, "_api_put", fake_put)
+        monkeypatch.setattr("kernelci_labgrid.scheduler.pull_agent.random.uniform", lambda a, b: 0)
         return calls, state
 
     async def test_claims_available_job(self, agent, api):
@@ -179,7 +196,7 @@ class TestClaim:
     async def test_poll_query(self, agent, api, monkeypatch):
         calls, _ = api
         started = []
-        monkeypatch.setattr(agent, "_execute_job", lambda job: _record(started, job))
+        monkeypatch.setattr(agent, "_execute_job", lambda job, lease=None: _record(started, job))
         await agent._poll_and_execute()
         endpoint, params = calls["get"][0]
         assert endpoint == "/nodes"
@@ -188,6 +205,35 @@ class TestClaim:
         assert params["data.runtime"] == "openwrt-local"
         assert params["data.platform"] == "qemu_armsr-armv8"
         assert "qemu_armsr-armv8" in agent._busy_platforms
+
+    async def test_lost_race_backs_off(self, agent, api, monkeypatch):
+        calls, state = api
+
+        async def racing_put(endpoint, data):
+            calls["put"].append((endpoint, data))
+            # Another lab writes its claim right after ours
+            state["node"] = dict(data, data=dict(data["data"], job_id="other-lab:xyz"))
+            return data
+
+        monkeypatch.setattr(agent, "_api_put", racing_put)
+        assert await agent._claim(JOB) is None
+
+    async def test_pool_job_moves_to_lab(self, agent, api):
+        calls, state = api
+        agent.pool = "openwrt-labs"
+        state["node"]["data"]["runtime"] = "openwrt-labs"
+        claimed = await agent._claim(state["node"])
+        assert claimed["data"]["runtime"] == "openwrt-local"
+        assert claimed["data"]["pool"] == "openwrt-labs"
+
+    async def test_polls_lab_then_pool(self, agent, api, monkeypatch):
+        calls, state = api
+        agent.pool = "openwrt-labs"
+        state["node"]["data"]["job_id"] = "other-lab:abc"  # nothing claimable
+        await agent._poll_and_execute()
+        runtimes = [p["data.runtime"] for e, p in calls["get"] if e == "/nodes"]
+        assert runtimes == ["openwrt-local", "openwrt-labs"]
+        assert not calls["put"]
 
     async def test_unhealthy_platform_not_polled(self, agent, api):
         from kernelci_labgrid.scheduler.pull_agent import DeviceHealth

@@ -29,6 +29,13 @@ dependencies = [
     "aiohttp>=3.9.0",
     "pyyaml>=6.0",
     "tomli>=2.0; python_version < '3.11'",
+    # Same labgrid as openwrt-tests (talks to the lab's coordinator)
+    "labgrid @ git+https://github.com/aparcar/labgrid.git@aparcar/rebase",
+    # Run test suites like openwrt-tests from this environment (labgrid's
+    # pytest plugin comes with labgrid)
+    "pytest>=8.4",
+    "pytest-check>=2.5",
+    "pytest-harvest>=1.10",
 ]
 
 [project.optional-dependencies]
@@ -51,6 +58,9 @@ Homepage = "https://github.com/kernelci/kernelci-labgrid"
 Documentation = "https://docs.kernelci.org/"
 Repository = "https://github.com/kernelci/kernelci-labgrid"
 Issues = "https://github.com/kernelci/kernelci-labgrid/issues"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kernelci_labgrid"]

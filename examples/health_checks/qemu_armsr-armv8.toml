@@ -1,0 +1,22 @@
+# Health check for the QEMU arm64 (armsr-armv8) target: one device per file
+# in health_checks_dir. The same keys work in a [health_checks.<device>]
+# table of the agent's config file.
+#
+# Runs every frequency_hours with a known-good OpenWrt image to verify the
+# device and lab work. Results stay local (health state file) and gate job
+# execution; they are not published to KernelCI.
+
+# Platform name, as in jobs and targets/<device>.yaml (default: file name)
+device = "qemu_armsr-armv8"
+
+# All optional (defaults shown). The golden image comes from the target
+# file's openwrt: section in its healthcheck_version, `release` or the
+# current stable release.
+# release = "25.12.5"
+# test_path = "test_base.py::test_shell test_base.py::test_ssh"
+frequency_hours = 24
+timeout = 600
+
+# Or an explicit golden image:
+# firmware = "https://downloads.openwrt.org/releases/25.12.5/targets/armsr/armv8/openwrt-25.12.5-armsr-armv8-generic-initramfs-kernel.bin"
+# sha256 = "f510b0c73c1ee70a64df384d7e2ad4404caf83e6bc7cce9ac13426f77b9ae3be"
