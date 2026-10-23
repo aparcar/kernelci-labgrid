@@ -1434,6 +1434,8 @@ def main() -> None:
     parser.add_argument("--health-checks-dir", "-c",
                         help="Directory with health check TOML files, one per device")
     parser.add_argument("--health-state-file", "-s", help="JSON file to persist device health state")
+    parser.add_argument("--no-health-checks", dest="health_checks", action="store_const", const=False,
+                        help="No health checks for all platforms (only --health-checks-dir ones)")
     parser.add_argument("--coordinator", help="The lab's labgrid-coordinator host:port (default: "
                                               "127.0.0.1:20408 or LG_COORDINATOR; '' for QEMU only)")
     parser.add_argument("--labgrid-command", help="labgrid-client command for power off "
@@ -1492,7 +1494,7 @@ def main() -> None:
         poll_interval=int(settings["poll_interval"]),
         artifact_dir=settings["artifact_dir"],
         health_checks_dir=settings["health_checks_dir"],
-        health_checks=settings["health_checks"],
+        health_checks=settings["health_checks"] if settings["health_checks"] is not False else None,
         health_state_file=settings["health_state_file"],
         coordinator=settings["coordinator"],
         labgrid_command=settings["labgrid_command"],

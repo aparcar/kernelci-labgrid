@@ -107,8 +107,19 @@ def test_config_table(tmp_path):
     assert HealthCheckConfig.split_table(table) == ({"timeout": 300}, {"rpi-4": {"enabled": False}})
 
 
-def test_no_table_means_none(tmp_path):
-    assert resolve_settings({}, environ={})["health_checks"] is None
+def test_enabled_by_default(tmp_path):
+    assert resolve_settings({}, environ={})["health_checks"] == {}
+
+
+@pytest.mark.parametrize("line, expected", [("true", {}), ("false", False)])
+def test_config_switch(tmp_path, line, expected):
+    path = tmp_path / "lab.toml"
+    path.write_text(f'health_checks = {line}\n')
+    assert resolve_settings({}, config_path=path, environ={})["health_checks"] == expected
+
+
+def test_cli_disables(tmp_path):
+    assert resolve_settings({"health_checks": False}, environ={})["health_checks"] is False
 
 
 def test_defaults():
