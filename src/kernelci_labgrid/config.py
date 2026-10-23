@@ -25,7 +25,8 @@ TOML assigns later keys to the table above them):
     url = "https://files.example.org/"
     token = "..."
 
-    # Health checks for all platforms; golden images from the target files
+    # Health checks run for all platforms (golden images from the target
+    # files); optional settings, or `health_checks = false` above to disable
     [health_checks]
     # frequency_hours = 24
 
@@ -61,9 +62,10 @@ DEFAULTS: dict[str, Any] = {
     "artifact_dir": None,
     "health_checks_dir": None,
     "health_state_file": None,
-    # [health_checks] table (even empty): health checks for all platforms;
-    # plain keys apply to all, [health_checks.<device>] tables per device
-    "health_checks": None,
+    # Health checks for all platforms by default; a [health_checks] table
+    # holds settings: plain keys apply to all, [health_checks.<device>]
+    # tables per device. `health_checks = false`: only health_checks_dir
+    "health_checks": {},
     # Real hardware: the lab's labgrid-coordinator (host:port); "" = QEMU only
     "coordinator": "127.0.0.1:20408",
     "labgrid_command": None,
@@ -135,6 +137,8 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError(f"{path}: unknown settings: {', '.join(sorted(unknown))}")
     if isinstance(settings.get("platforms"), str):
         settings["platforms"] = [settings["platforms"]]
+    if settings.get("health_checks") is True:
+        settings["health_checks"] = {}
 
     base = path.resolve().parent
     for key in PATH_KEYS:

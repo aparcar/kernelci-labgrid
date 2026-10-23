@@ -128,6 +128,7 @@ labgrid-agent \
 | `--artifact-dir`, `-a` | Where to download firmware and keep job outputs |
 | `--health-checks-dir`, `-c` | Directory with health check TOML files, one per device |
 | `--health-state-file`, `-s` | JSON file to persist device health state |
+| `--no-health-checks` | No health checks for all platforms (only `--health-checks-dir` ones) |
 | `--debug`, `-d` | Enable debug logging |
 
 ## How It Works
@@ -197,9 +198,11 @@ for a `bad` device are left `available` for other labs.
 
 ### Health Check Configuration
 
-An (even empty) `[health_checks]` table in the agent's config file enables
-health checks for all platforms of the lab (keep it after the plain keys,
-like `[api]`):
+Health checks run for all platforms of the lab by default. To turn them off,
+set `health_checks = false` in the config file (a plain key, before `[api]`)
+or pass `--no-health-checks`; then only devices in `health_checks_dir` are
+checked. Settings go in a `[health_checks]` table (keep it after the plain
+keys, like `[api]`):
 
 ```toml
 [health_checks]
@@ -250,8 +253,9 @@ sha256 = "…"
 
 Set `health_state_file` to keep results across restarts. Alternatively,
 `health_checks_dir` holds one TOML file per device with the same keys plus
-`device` (default: the file name); without a `[health_checks]` table only
-those devices are checked. See [`examples/health_checks/`](examples/health_checks/).
+`device` (default: the file name); a file overrides the `[health_checks]`
+settings for its device, and with `health_checks = false` only those devices
+are checked. See [`examples/health_checks/`](examples/health_checks/).
 
 ### Device Health States
 
