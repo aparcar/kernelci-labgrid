@@ -223,6 +223,35 @@ class TestParseJunitXml:
         assert result.passed == 2
         assert result.failed == 1
 
+    def test_parse_per_test_log(self, agent, tmp_path):
+        """junit_logging=all: each test's console lines, then its traceback."""
+        junit_xml = tmp_path / "results.xml"
+        junit_xml.write_text("""<?xml version="1.0" encoding="utf-8"?>
+<testsuite name="pytest" tests="2" errors="0" failures="1" skipped="0" time="2.0">
+    <testcase classname="tests.test_base" name="test_shell" time="1.0">
+        <system-out>------- Captured Log -------
+CONSOLE    SerialDriver: U-Boot boot output
+</system-out>
+        <system-err>------- Captured Err -------
+
+</system-err>
+    </testcase>
+    <testcase classname="tests.test_base" name="test_ubus" time="1.0">
+        <failure message="boom">E       AssertionError: boom</failure>
+        <system-out>------- Captured Log -------
+CONSOLE    SerialDriver: root@OpenWrt:~# ubus call system board
+</system-out>
+    </testcase>
+</testsuite>
+""")
+
+        shell, ubus = agent._parse_junit_xml(junit_xml).test_cases
+
+        assert shell["log"] == ("------- Captured Log -------\n"
+                                "CONSOLE    SerialDriver: U-Boot boot output")
+        assert "Captured Err" not in shell["log"]
+        assert ubus["log"].index("ubus call system board") < ubus["log"].index("AssertionError: boom")
+
 
 class TestMapOutcome:
     """Tests for pytest/JUnit outcome mapping."""

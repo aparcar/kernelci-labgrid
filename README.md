@@ -147,11 +147,15 @@ labgrid-agent \
 5. **Runs pytest** in `tests_dir`, with the agent's own Python:
    ```bash
    python -m pytest <selection> --lg-env <run>/env/targets/<platform>.yaml \
-       --firmware <image> --lg-log=<out> --junit-xml=<out>/results.xml
+       --firmware <image> --lg-log=<out> --junit-xml=<out>/results.xml \
+       -o junit_logging=all
    ```
    `<run>/env/targets/<platform>.yaml` is a symlink to the target file next to
    `<run>/env/strategies` → `strategies_dir`.
-6. **Uploads** console log, pytest log and JUnit XML to kernelci-storage
+6. **Uploads** console log, pytest log and JUnit XML to kernelci-storage, plus
+   one log per test (`tests/<module>.<test>.log`: the console lines and log
+   records during that test, from the JUnit XML, then its traceback). A test
+   node's `test_log` is its own log; the job and boot nodes keep the full console
 7. **Reports back** with `PUT /nodes/<job>`: the job node plus one child per test
    module and one leaf per test (paths `…/openwrt-tests/<module>/<test>`), and
    creates a sibling `boot` test node under the build (result from `test_shell`)

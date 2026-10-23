@@ -128,6 +128,19 @@ class TestBuildHierarchy:
         assert ssh["data"]["error_msg"] == "timeout"
         assert ssh["data"]["duration_ms"] == 3000
 
+    def test_per_test_log(self, agent):
+        with_log = {**case("base", "test_shell", "pass"), "log_url": "http://storage/tests/base.test_shell.log"}
+        result = TestResult(passed=2, total=2, returncode=0,
+                            test_cases=[with_log, case("base", "test_ssh", "pass")])
+        h = agent._build_hierarchy(JOB, result, {"test_log": "http://storage/console",
+                                                 "junit": "http://storage/results.xml"})
+
+        shell, ssh = (c["node"] for c in h["child_nodes"][0]["child_nodes"])
+        assert shell["artifacts"] == {"test_log": "http://storage/tests/base.test_shell.log",
+                                      "console_log": "http://storage/console",
+                                      "junit": "http://storage/results.xml"}
+        assert ssh["artifacts"] == {}  # no log of its own: KCIDB uses the job's
+
     def test_infra_error_code(self, agent):
         h = agent._build_hierarchy(JOB, TestResult(returncode=2), {})
         assert h["node"]["result"] == "incomplete"
