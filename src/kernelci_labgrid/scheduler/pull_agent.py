@@ -744,7 +744,9 @@ class LabgridAgent:
             if not self.is_device_healthy(platform):
                 # Leave the job for another lab; the pipeline's timeout
                 # service closes it if nobody picks it up.
-                logger.debug(f"Skipping {platform}: device unhealthy")
+                health = self._device_health[platform]
+                logger.info(f"Skipping {platform}: health check failed "
+                            f"({health.last_check}), no jobs until one passes")
                 continue
 
             # Jobs pinned to this lab first, then jobs in the shared pool
@@ -802,7 +804,7 @@ class LabgridAgent:
             logger.warning(f"{platform} needs a labgrid place, but no coordinator is configured")
             return None
         if not any(p.free for p in self._places if p.device == platform):
-            logger.debug(f"No free place for {platform}")
+            logger.info(f"No free place for {platform}")
             return None
         try:
             return await self._labgrid.reserve(platform, self.reserve_timeout)
