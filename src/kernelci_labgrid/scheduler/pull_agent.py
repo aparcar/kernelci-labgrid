@@ -834,13 +834,16 @@ class LabgridAgent:
 
         claim_id = f"{self.lab_name}:{uuid.uuid4().hex}"
         data = current.setdefault("data", {})
+        # Our own fields go in data.misc: Maestro drops data fields its job
+        # model doesn't know (see openwrtci's deploy/DATA.md)
+        misc = data["misc"] = dict(data.get("misc") or {})
         if self.pool and data.get("runtime") == self.pool:
             # Take the job out of the shared pool: from now on it belongs to
             # this lab (and only this lab may update it)
-            data["pool"] = self.pool
+            misc["pool"] = self.pool
             data["runtime"] = self.lab_name
         data["job_id"] = claim_id
-        data["worker"] = self.worker_id
+        misc["worker"] = self.worker_id
         try:
             await self._api_put(f"/node/{node_id}", self._writable(current))
         except Exception as e:
@@ -859,7 +862,7 @@ class LabgridAgent:
             logger.info(f"Job {node_id} was claimed by another lab, backing off")
             return None
 
-        source = f" from pool {self.pool}" if data.get("pool") else ""
+        source = f" from pool {self.pool}" if misc.get("pool") else ""
         logger.info(f"Claimed {current.get('name')} ({node_id}) for {data.get('platform')}{source}")
         return claimed
 
@@ -1294,7 +1297,8 @@ class LabgridAgent:
         for module, cases in modules.items():
             leaves = []
             for tc in cases:
-                data: dict[str, Any] = {**node_data, "duration_ms": int(tc["duration"] * 1000)}
+                # misc: Maestro drops data fields its test model doesn't know
+                data: dict[str, Any] = {**node_data, "misc": {"duration_ms": int(tc["duration"] * 1000)}}
                 if tc.get("message"):
                     data["error_msg"] = tc["message"][:1000]
                 leaves.append({"node": {
@@ -1320,17 +1324,21 @@ class LabgridAgent:
         node["state"] = "done"
         node["result"] = self._job_result(result)
         node["artifacts"] = {**(job.get("artifacts") or {}), **artifacts}
-        node["data"] = {**(job.get("data") or {}), **node_data,
-                        "duration_ms": int(result.duration * 1000),
-                        # lets dashboards show counts without fetching the tests
-                        "summary": {
-                            "total": result.total,
-                            "passed": result.passed,
-                            "failed": result.failed,
-                            "errors": result.errors,
-                            "skipped": result.skipped,
-                            "boot": result.boot_result,
-                        }}
+        job_data = job.get("data") or {}
+        node["data"] = {**job_data, **node_data,
+                        # In misc (kept with what the scheduler put there):
+                        # Maestro drops data fields its job model doesn't know
+                        "misc": {**(job_data.get("misc") or {}),
+                                 "duration_ms": int(result.duration * 1000),
+                                 # lets dashboards show counts without fetching the tests
+                                 "summary": {
+                                     "total": result.total,
+                                     "passed": result.passed,
+                                     "failed": result.failed,
+                                     "errors": result.errors,
+                                     "skipped": result.skipped,
+                                     "boot": result.boot_result,
+                                 }}}
         if result.returncode == PYTEST_RC_NO_SHELL:
             node["data"]["error_msg"] = "firmware did not reach a shell"
         elif node["result"] == "incomplete":
@@ -1396,9 +1404,11 @@ class LabgridAgent:
             if current.get("state") != "available" or data.get("job_id") != claim_id:
                 return
             data.pop("job_id", None)
-            data.pop("worker", None)
-            if data.get("pool"):
-                data["runtime"] = data.pop("pool")
+            misc = data["misc"] = dict(data.get("misc") or {})
+            misc.pop("worker", None)
+            pool = misc.pop("pool", None)
+            if pool:
+                data["runtime"] = pool
             current["data"] = data
             await self._api_put(f"/node/{node_id}", self._writable(current))
         except Exception as e:
