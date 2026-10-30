@@ -17,7 +17,8 @@ JOB = {
     "state": "available",
     "created": "2026-10-01T10:00:00",
     "artifacts": {"job_definition": "http://storage/openwrt/jobs/job1.json"},
-    "data": {"runtime": "openwrt-local", "platform": "qemu_armsr-armv8", "arch": "aarch64_generic"},
+    "data": {"runtime": "openwrt-local", "platform": "qemu_armsr-armv8", "arch": "aarch64_generic",
+             "misc": {"openwrt": {"name": "QEMU arm64"}}},
 }
 
 
@@ -111,7 +112,8 @@ class TestBuildHierarchy:
         assert node["artifacts"]["job_definition"] == JOB["artifacts"]["job_definition"]
         assert node["artifacts"]["test_log"] == "http://storage/console"
         assert node["data"]["device"] == "openwrt-local-qemu_armsr-armv8"
-        assert node["data"]["summary"] == {
+        assert node["data"]["misc"]["openwrt"] == {"name": "QEMU arm64"}  # scheduler's, kept
+        assert node["data"]["misc"]["summary"] == {
             "total": 4, "passed": 2, "failed": 1, "errors": 0, "skipped": 1, "boot": "pass"}
 
         modules = {c["node"]["name"]: c for c in h["child_nodes"]}
@@ -126,7 +128,7 @@ class TestBuildHierarchy:
         assert ssh["path"] == JOB["path"] + ["base", "test_ssh"]
         assert ssh["result"] == "fail"
         assert ssh["data"]["error_msg"] == "timeout"
-        assert ssh["data"]["duration_ms"] == 3000
+        assert ssh["data"]["misc"]["duration_ms"] == 3000
 
     def test_per_test_log(self, agent):
         with_log = {**case("base", "test_shell", "pass"), "log_url": "http://storage/tests/base.test_shell.log"}
@@ -224,7 +226,8 @@ class TestClaim:
         state["node"]["data"]["runtime"] = "openwrt-labs"
         claimed = await agent._claim(state["node"])
         assert claimed["data"]["runtime"] == "openwrt-local"
-        assert claimed["data"]["pool"] == "openwrt-labs"
+        assert claimed["data"]["misc"]["pool"] == "openwrt-labs"
+        assert claimed["data"]["misc"]["worker"] == agent.worker_id
 
     async def test_polls_lab_then_pool(self, agent, api, monkeypatch):
         calls, state = api

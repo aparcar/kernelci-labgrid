@@ -87,12 +87,14 @@ def api(agent, monkeypatch):
 
 async def test_unclaim_returns_pool_job(agent, api):
     api["node"] = {"id": "j1", "state": "available", "created": "x",
-                   "data": {"runtime": "lab", "pool": "openwrt-labs",
-                            "job_id": "lab:1", "worker": "lab@host"}}
+                   "data": {"runtime": "lab", "job_id": "lab:1",
+                            "misc": {"pool": "openwrt-labs", "worker": "lab@host",
+                                     "openwrt": {"name": "x"}}}}
     await agent._unclaim({"id": "j1", "data": {"job_id": "lab:1"}})
     data = api["put"]["data"]
     assert data["runtime"] == "openwrt-labs"
-    assert "job_id" not in data and "worker" not in data and "pool" not in data
+    assert "job_id" not in data
+    assert data["misc"] == {"openwrt": {"name": "x"}}  # the scheduler's part stays
 
 
 async def test_unclaim_keeps_jobs_of_others(agent, api):
