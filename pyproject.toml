@@ -30,7 +30,7 @@ dependencies = [
     "pyyaml>=6.0",
     "tomli>=2.0; python_version < '3.11'",
     # Same labgrid as openwrt-tests (talks to the lab's coordinator)
-    "labgrid @ git+https://github.com/aparcar/labgrid.git@aparcar/rebase",
+    "labgrid @ git+https://github.com/aparcar/labgrid.git@staging",
     # Run test suites like openwrt-tests from this environment (labgrid's
     # pytest plugin comes with labgrid)
     "pytest>=8.4",
