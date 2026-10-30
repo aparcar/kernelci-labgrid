@@ -58,7 +58,7 @@ class Place:
 class Lease:
     """A reserved and locked place, held for one job or health check."""
 
-    token: str
+    reservation_id: str
     place: str
     refresher: asyncio.Task | None = None
 
@@ -161,22 +161,23 @@ class Coordinator:
         request = pb2.CreateReservationRequest(
             filters={"main": pb2.Reservation.Filter(filter={"device": platform})}, prio=0.0)
         response = await self.session.stub.CreateReservation(request)
-        token = Reservation.from_pb2(response.reservation).token
+        # upstream labgrid: Reservation.id (the protobuf field is still `token`)
+        reservation_id = Reservation.from_pb2(response.reservation).id
 
         place = None
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and not self.stopping:
-            res = await self._poll(token)
+            res = await self._poll(reservation_id)
             if res.state is ReservationState.allocated:
                 place = (res.allocations.get("main") or [None])[0]
                 break
             if res.state is not ReservationState.waiting:
-                logger.warning(f"Reservation {token} for {platform} ended as {res.state.name}")
+                logger.warning(f"Reservation {reservation_id} for {platform} ended as {res.state.name}")
                 break
             await asyncio.sleep(1)
 
         if not place or self.stopping:
-            await self.cancel(token)
+            await self.cancel(reservation_id)
             if not self.stopping:
                 logger.info(f"No place for {platform} within {timeout:.0f}s")
             return None
@@ -186,32 +187,32 @@ class Coordinator:
             await self.session.sync_with_coordinator()
         except grpc.aio.AioRpcError as e:
             logger.warning(f"Cannot lock place {place}: {e.details()}")
-            await self.cancel(token)
+            await self.cancel(reservation_id)
             return None
 
-        lease = Lease(token=token, place=place)
-        lease.refresher = asyncio.create_task(self._refresh(token))
-        logger.info(f"Reserved and locked place {place} for {platform} (reservation {token})")
+        lease = Lease(reservation_id=reservation_id, place=place)
+        lease.refresher = asyncio.create_task(self._refresh(reservation_id))
+        logger.info(f"Reserved and locked place {place} for {platform} (reservation {reservation_id})")
         return lease
 
-    async def _poll(self, token: str) -> Reservation:
-        response = await self.session.stub.PollReservation(pb2.PollReservationRequest(token=token))
+    async def _poll(self, reservation_id: str) -> Reservation:
+        response = await self.session.stub.PollReservation(pb2.PollReservationRequest(token=reservation_id))
         return Reservation.from_pb2(response.reservation)
 
-    async def _refresh(self, token: str) -> None:
+    async def _refresh(self, reservation_id: str) -> None:
         """Keep a reservation alive while its job runs."""
         while True:
             await asyncio.sleep(REFRESH_INTERVAL)
             try:
-                await self._poll(token)
+                await self._poll(reservation_id)
             except Exception as e:
-                logger.warning(f"Refreshing reservation {token} failed: {e}")
+                logger.warning(f"Refreshing reservation {reservation_id} failed: {e}")
 
-    async def cancel(self, token: str) -> None:
+    async def cancel(self, reservation_id: str) -> None:
         try:
-            await self.session.stub.CancelReservation(pb2.CancelReservationRequest(token=token))
+            await self.session.stub.CancelReservation(pb2.CancelReservationRequest(token=reservation_id))
         except Exception as e:
-            logger.warning(f"Cancelling reservation {token} failed: {e}")
+            logger.warning(f"Cancelling reservation {reservation_id} failed: {e}")
 
     def env(self, lease: Lease) -> dict[str, str]:
         """Environment for pytest (and labgrid-client) on the leased place."""
@@ -228,7 +229,7 @@ class Coordinator:
             await self.session.sync_with_coordinator()
         except Exception as e:
             logger.warning(f"Unlocking place {lease.place} failed: {e}")
-        await self.cancel(lease.token)
+        await self.cancel(lease.reservation_id)
         logger.info(f"Released place {lease.place}")
 
     async def power_off(self, lease: Lease, timeout: float = 60) -> None:

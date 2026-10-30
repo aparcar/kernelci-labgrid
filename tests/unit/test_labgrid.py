@@ -31,10 +31,10 @@ class FakeLabgrid:
 
     async def reserve(self, platform, timeout):
         self.calls.append(("reserve", platform))
-        return Lease(token="TOKEN1", place=self.place)
+        return Lease(reservation_id="RES1", place=self.place)
 
     async def release(self, lease):
-        self.calls.append(("release", lease.token))
+        self.calls.append(("release", lease.reservation_id))
 
     def env(self, lease):
         return {"LG_COORDINATOR": self.address, "LG_PLACE": lease.place}
@@ -124,7 +124,7 @@ async def test_failed_claim_releases_place(agent, monkeypatch):
     started = _jobs(monkeypatch, agent, claim_ok=False)
     await agent._poll_and_execute()
     assert started == []
-    assert ("release", "TOKEN1") in fake.calls
+    assert ("release", "RES1") in fake.calls
 
 
 def test_device_is_the_place(agent):
