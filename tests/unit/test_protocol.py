@@ -238,6 +238,13 @@ class TestClaim:
         assert runtimes == ["openwrt-local", "openwrt-labs"]
         assert not calls["put"]
 
+    async def test_max_jobs_stops_polling(self, agent, api):
+        calls, _ = api
+        agent.max_jobs = 1
+        agent._busy_platforms.add("qemu_x86-64")  # one job already running
+        await agent._poll_and_execute()
+        assert "get" not in calls
+
     async def test_unhealthy_platform_not_polled(self, agent, api):
         from kernelci_labgrid.scheduler.pull_agent import DeviceHealth
 

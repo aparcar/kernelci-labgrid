@@ -123,6 +123,7 @@ labgrid-agent \
 | `--pool` | Shared runtime to also take jobs from, e.g. `openwrt-labs` (or `LAB_POOL`) |
 | `--coordinator` | The lab's labgrid-coordinator, enables real hardware (or `LG_COORDINATOR`) |
 | `--reserve-timeout` | Seconds to wait for a free place before leaving a job (default: 60) |
+| `--max-jobs` | At most this many jobs at once, e.g. for QEMU on a small machine (default: one per platform, no limit; or `LAB_MAX_JOBS`) |
 | `--poll-interval`, `-p` | Seconds between polls (default: 30) |
 | `--once` | Poll once, wait for started jobs, exit |
 | `--artifact-dir`, `-a` | Where to download firmware and keep job outputs |

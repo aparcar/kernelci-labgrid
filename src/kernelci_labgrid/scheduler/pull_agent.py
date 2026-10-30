@@ -261,6 +261,7 @@ class LabgridAgent:
         pool: str | None = None,
         strategies_dir: str | Path | None = None,
         reserve_timeout: int = 60,
+        max_jobs: int | None = None,
     ):
         """Initialize the agent.
 
@@ -297,6 +298,8 @@ class LabgridAgent:
                 a job for later
             pool: Shared runtime that several labs take jobs from (jobs for
                 any lab offering the platform); claiming moves a job to this lab
+            max_jobs: At most this many jobs at once (e.g. QEMU on a small
+                machine); default: one per platform, no overall limit
         """
         self.api_url = api_url.rstrip("/")
         self.api_token = api_token
@@ -312,6 +315,7 @@ class LabgridAgent:
         self.configured_platforms = list(platforms or [])
         self.platforms = list(self.configured_platforms)
         self.reserve_timeout = reserve_timeout
+        self.max_jobs = max_jobs or None
         self.pool = pool or None
         if not labgrid_command:
             labgrid_command = shlex.join([str(Path(sys.executable).parent / "labgrid-client")])
@@ -737,6 +741,9 @@ class LabgridAgent:
 
         for platform in self.platforms:
             if self._stopping:
+                break
+            # one job per platform; max_jobs caps them all together
+            if self.max_jobs and len(self._busy_platforms) >= self.max_jobs:
                 break
             if platform in self._busy_platforms:
                 continue
@@ -1502,6 +1509,8 @@ def main() -> None:
     parser.add_argument("--pool", help="Shared runtime to also take jobs from (e.g. openwrt-labs)")
     parser.add_argument("--reserve-timeout", type=int,
                         help="Seconds to wait for a free place before leaving a job (default: 60)")
+    parser.add_argument("--max-jobs", type=int,
+                        help="At most this many jobs at once (default: one per platform, no limit)")
     parser.add_argument("--debug", "-d", action="store_true", help="Debug logging")
 
     args = parser.parse_args()
@@ -1558,6 +1567,7 @@ def main() -> None:
         coordinator=settings["coordinator"],
         labgrid_command=settings["labgrid_command"],
         reserve_timeout=int(settings["reserve_timeout"]),
+        max_jobs=int(settings["max_jobs"]) if settings["max_jobs"] else None,
         pool=settings["pool"],
     )
 

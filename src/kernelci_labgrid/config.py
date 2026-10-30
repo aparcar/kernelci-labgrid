@@ -70,6 +70,8 @@ DEFAULTS: dict[str, Any] = {
     "coordinator": "127.0.0.1:20408",
     "labgrid_command": None,
     "reserve_timeout": 60,
+    # At most this many jobs at once (None: one per platform, no limit)
+    "max_jobs": None,
     # Shared runtime several labs take jobs from (e.g. "openwrt-labs")
     "pool": None,
 }
@@ -94,6 +96,7 @@ ENV_KEYS = {
     "health_state_file": ("LABGRID_HEALTH_STATE_FILE",),
     "coordinator": ("LG_COORDINATOR",),
     "pool": ("LAB_POOL",),
+    "max_jobs": ("LAB_MAX_JOBS",),
 }
 
 SECRET_KEYS = ("api_token", "storage_token")
