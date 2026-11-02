@@ -3,8 +3,8 @@
 # table of the agent's config file.
 #
 # Runs every frequency_hours with a known-good OpenWrt image to verify the
-# device and lab work. Results stay local (health state file) and gate job
-# execution; they are not published to KernelCI.
+# device and lab work. Results gate job execution and are reported to the
+# KernelCI API (see README, "Health Reports").
 
 # Platform name, as in jobs and targets/<device>.yaml (default: file name)
 device = "qemu_armsr-armv8"

@@ -50,7 +50,8 @@ A single daemon that connects your Labgrid test lab to KernelCI. Runs locally in
 
 ## Requirements
 
-- Python 3.10+ (the agent brings labgrid, pytest, pytest-check and pytest-harvest)
+- Python 3.13+ (labgrid's `staging` branch needs it; the agent brings labgrid,
+  pytest, pytest-check and pytest-harvest)
 - A test suite, e.g. from openwrt-tests, in three directories that can live
   anywhere:
   - `tests_dir`: pytest tests incl. `conftest.py`; pytest runs there
@@ -92,17 +93,34 @@ labgrid-agent --platform qemu_x86-64 --once
 ```
 
 Without a config file, everything can be given as options and environment
-variables (`LAB_NAME`, `KCI_API_URL`, `LAB_API_TOKEN`, `KCI_STORAGE_URL`,
-`LAB_STORAGE_TOKEN`, also readable from a KEY=VALUE `--env-file`):
+variables, also readable from a KEY=VALUE `--env-file`. A QEMU-only lab sets
+`--coordinator ""` (the default is a local coordinator, see
+[Real hardware](#real-hardware-labgrid)):
 
 ```bash
 labgrid-agent \
     --env-file /path/to/lab.env \
     --tests-dir /path/to/openwrt-tests/tests \
+    --coordinator "" \
     --platform qemu_armsr-armv8 \
     --health-checks-dir examples/health_checks \
     --health-state-file /var/lib/labgrid/health_state.json
 ```
+
+### Environment variables
+
+| Variable | Setting |
+|----------|---------|
+| `LAB_NAME` | `lab_name` |
+| `KCI_API_URL` | `api_url` (default: `https://api.kernelci.org/latest`) |
+| `LAB_API_TOKEN`, `KCI_API_TOKEN` | `api_token` |
+| `KCI_STORAGE_URL`, `LAB_STORAGE_TOKEN` | `storage_url`, `storage_token` |
+| `LG_COORDINATOR` | `coordinator` |
+| `LAB_POOL` | `pool` |
+| `LAB_MAX_JOBS` | `max_jobs` |
+| `LABGRID_TESTS_DIR`, `LABGRID_TARGETS_DIR`, `LABGRID_STRATEGIES_DIR` | test suite paths |
+| `LABGRID_ARTIFACT_DIR`, `LABGRID_HEALTH_CHECKS_DIR`, `LABGRID_HEALTH_STATE_FILE` | agent paths |
+| `LABGRID_AGENT_CONFIG` | config file, if no `--config` |
 
 ### Options
 
@@ -112,7 +130,7 @@ labgrid-agent \
 | `--tests-dir`, `-t` | pytest tests incl. `conftest.py`; pytest runs there |
 | `--targets-dir` | labgrid target YAMLs (default: `<tests_dir>/../targets`) |
 | `--strategies-dir` | labgrid strategies imported by the targets (default: `<targets_dir>/../strategies`) |
-| `--platform` | Platform this lab serves (`targets/<name>.yaml`), repeatable; default: all targets |
+| `--platform` | Platform this lab serves (`targets/<name>.yaml`), repeatable. With a coordinator: adds QEMU targets, hardware ones restrict the discovered list; without: the full list |
 | `--api-url` | API URL including version, e.g. `http://localhost:8001/latest` (or `KCI_API_URL`) |
 | `--api-token` | Lab API token (or `LAB_API_TOKEN` / `KCI_API_TOKEN`) |
 | `--storage-url`, `--storage-token` | kernelci-storage for log uploads (or `KCI_STORAGE_URL` / `LAB_STORAGE_TOKEN`) |
@@ -121,7 +139,8 @@ labgrid-agent \
 | `--env-file` | Read the settings above from a KEY=VALUE file |
 | `--pytest-command` | How to run pytest in `tests_dir` (default: `python -m pytest` of the agent's environment) |
 | `--pool` | Shared runtime to also take jobs from, e.g. `openwrt-labs` (or `LAB_POOL`) |
-| `--coordinator` | The lab's labgrid-coordinator, enables real hardware (or `LG_COORDINATOR`) |
+| `--coordinator` | The lab's labgrid-coordinator `host:port` (default: `127.0.0.1:20408`, or `LG_COORDINATOR`); `""` for a QEMU-only lab |
+| `--labgrid-command` | labgrid-client command for power off (default: the agent environment's `labgrid-client`) |
 | `--reserve-timeout` | Seconds to wait for a free place before leaving a job (default: 60) |
 | `--max-jobs` | At most this many jobs at once, e.g. for QEMU on a small machine (default: one per platform, no limit; or `LAB_MAX_JOBS`) |
 | `--poll-interval`, `-p` | Seconds between polls (default: 30) |
@@ -175,12 +194,17 @@ places locked.
 ## Real hardware (labgrid)
 
 Each lab runs its own labgrid-coordinator; the agent runs in the lab next to
-it and only needs outbound HTTPS to the KernelCI instance. With
-`coordinator` set (or `LG_COORDINATOR`):
+it and only needs outbound HTTPS to the KernelCI instance. `coordinator`
+defaults to `127.0.0.1:20408` (or `LG_COORDINATOR`), so real hardware is the
+default case; a QEMU-only lab sets `coordinator = ""` and then serves exactly
+its configured `platforms` (the agent refuses to start with neither). With a
+coordinator:
 
 - **Platforms** are the `device=<platform>` tags of the coordinator's places
-  (openwrt-tests sets them from `labnet.yaml`). `platforms` in the config
-  adds local QEMU targets; hardware platforms in it restrict the list.
+  (openwrt-tests sets them from `labnet.yaml`). Local QEMU targets in
+  `platforms` are added to them; hardware platforms in `platforms` restrict
+  the discovered list, so a lab can list only its `qemu_*` targets and still
+  serve all of its boards. On coordinator errors the previous list is kept.
 - **Maintenance:** a place tagged `maintenance=<reason>`
   (`labgrid-client -p <place> set-tags maintenance=new_psu`) gets no jobs or
   health checks; a device whose places are all in maintenance is reported as
@@ -203,7 +227,7 @@ library, pinned to the same labgrid as openwrt-tests.
 
 ## Health Checks
 
-Similar to LAVA, the agent can run periodic health checks with a known-good
+Similar to LAVA, the agent runs periodic health checks with a known-good
 image. Results gate job execution (jobs for a `bad` device are left
 `available` for other labs) and are reported to the API, where they are the
 server's list of the lab's devices (see [Health Reports](#health-reports)).
@@ -345,6 +369,36 @@ The job definition it points to (PULL_LABS-shaped, plus a firmware artifact):
 `parameters` is the pytest selection relative to `tests_dir`, e.g.
 `test_base.py::test_shell`; empty runs all tests. A leading `tests/` (from jobs
 created for the openwrt-tests repository layout) is stripped.
+
+## Container
+
+The [`Dockerfile`](Dockerfile) builds an image with the agent (and labgrid),
+QEMU and openwrt-tests' `tests/`, `targets/` and `strategies/` baked in
+(`OPENWRT_TESTS_REPO`, `OPENWRT_TESTS_REF` build args). It reads
+`/etc/labgrid-agent/config.toml`:
+
+```bash
+podman build -t labgrid-agent .
+podman run -d --name labgrid-agent --restart unless-stopped \
+    --network host --privileged -v /dev:/dev \
+    -v ./my-lab.toml:/etc/labgrid-agent/config.toml:ro \
+    -v labgrid-agent-data:/var/lib/labgrid-agent \
+    labgrid-agent
+```
+
+`--network host` gives labgrid the exporters, coordinator and DUT networks
+as on the host; `--privileged -v /dev:/dev` gives it serial adapters, USB SD
+muxes and KVM, also when they are plugged in later.
+
+The image sets the `LABGRID_*` path variables to its own layout
+(`/opt/openwrt-tests/…`, state and artifacts in `/var/lib/labgrid-agent`,
+health check files in `/etc/labgrid-agent/health_checks`). They override the
+paths of the mounted config file, so a lab file generated for a bare host
+works unchanged; mount your own test suite and set them with `-e` to use it
+instead.
+
+[`examples/docker/`](examples/docker/) is a complete Docker Compose setup
+with a coordinator, a QEMU exporter and the agent.
 
 ## Systemd Service
 
