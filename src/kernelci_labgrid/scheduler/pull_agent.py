@@ -275,7 +275,8 @@ class LabgridAgent:
             storage_url: kernelci-storage URL for log uploads (optional)
             storage_token: kernelci-storage JWT with upload rights below
                 logs/<lab_name>/
-            platforms: Platforms this lab serves; default: every target YAML
+            platforms: Local (QEMU) platforms to run; hardware ones restrict
+                the platforms discovered from the coordinator (optional)
             pytest_command: Command to run pytest (default: `python -m pytest`
                 with this environment's Python, which includes labgrid)
             poll_interval: Seconds between API polls
@@ -712,8 +713,9 @@ class LabgridAgent:
     async def _refresh_platforms(self) -> None:
         """Hardware platforms = device tags of the coordinator's places.
 
-        Configured platforms restrict the hardware list and add local (QEMU)
-        targets. On coordinator errors the previous list is kept.
+        Configured local (QEMU) targets are added; configured hardware
+        platforms, if any, restrict the hardware list (local ones alone don't).
+        On coordinator errors the previous list is kept.
         """
         try:
             self._places = await self._labgrid.places()
@@ -725,10 +727,11 @@ class LabgridAgent:
         if missing:
             logger.debug(f"Places without a target file: {', '.join(missing)}")
         hardware = {d for d in hardware if d not in missing}
-        if self.configured_platforms:
-            hardware &= set(self.configured_platforms)
         local = {p for p in self.configured_platforms
                  if self._find_target_yaml(p) and not self._is_remote(p)}
+        allowed = set(self.configured_platforms) - local
+        if allowed:
+            hardware &= allowed
         platforms = sorted(hardware | local)
         if platforms != self.platforms:
             logger.info(f"Platforms: {', '.join(platforms) or '-'}")

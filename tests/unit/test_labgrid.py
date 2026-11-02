@@ -68,6 +68,13 @@ async def test_configured_platforms_restrict_hardware_and_add_qemu(agent):
     assert agent.platforms == ["openwrt_one", "qemu_x86-64"]
 
 
+async def test_configured_qemu_alone_keeps_all_hardware(agent):
+    agent._labgrid = FakeLabgrid(PLACES)
+    agent.configured_platforms = ["qemu_x86-64"]
+    await agent._refresh_platforms()
+    assert agent.platforms == ["bananapi_bpi-r4", "openwrt_one", "qemu_x86-64"]
+
+
 async def test_place_without_target_file_is_ignored(agent):
     agent._labgrid = FakeLabgrid([Place("p", {"device": "unknown_board"})])
     await agent._refresh_platforms()
