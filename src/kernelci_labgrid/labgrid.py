@@ -50,6 +50,12 @@ class Place:
         return self.tags.get("device")
 
     @property
+    def maintenance(self) -> str | None:
+        """The reason of a `maintenance=<reason>` tag (set by the lab admin:
+        no jobs or health checks), else None."""
+        return self.tags.get("maintenance")
+
+    @property
     def free(self) -> bool:
         return self.acquired is None and self.reservation is None
 
@@ -218,11 +224,13 @@ class Coordinator:
         """Environment for pytest (and labgrid-client) on the leased place."""
         return {"LG_COORDINATOR": self.address, "LG_PLACE": lease.place}
 
-    async def release(self, lease: Lease) -> None:
-        """Power off, unlock and cancel the reservation; never raises."""
+    async def release(self, lease: Lease, power_off: bool = True) -> None:
+        """Power off (unless not used), unlock and cancel the reservation;
+        never raises."""
         if lease.refresher:
             lease.refresher.cancel()
-        await self.power_off(lease)
+        if power_off:
+            await self.power_off(lease)
         try:
             await self.connect()
             await self.session.stub.ReleasePlace(pb2.ReleasePlaceRequest(placename=lease.place))

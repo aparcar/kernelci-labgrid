@@ -33,7 +33,7 @@ class FakeLabgrid:
         self.calls.append(("reserve", platform))
         return Lease(reservation_id="RES1", place=self.place)
 
-    async def release(self, lease):
+    async def release(self, lease, power_off=True):
         self.calls.append(("release", lease.reservation_id))
 
     def env(self, lease):

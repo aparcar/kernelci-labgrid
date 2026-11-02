@@ -25,7 +25,7 @@ A single daemon that connects your Labgrid test lab to KernelCI. Runs locally in
 │  ┌──────────┴──────────────────────┴──────────────────────────┐  │
 │  │ labgrid-agent                                              │  │
 │  │                                                            │  │
-│  │  1. run due health checks (local, gate job execution)      │  │
+│  │  1. run due health checks, report device health            │  │
 │  │  2. poll available jobs for this lab's platforms, claim    │  │
 │  │  3. fetch job definition, download + verify firmware       │  │
 │  │  4. pytest --lg-env targets/<platform>.yaml                │  │
@@ -134,7 +134,8 @@ labgrid-agent \
 
 ## How It Works
 
-1. **Checks health** - runs scheduled health checks if due (results stay local)
+1. **Checks health** - runs scheduled health checks if due and reports each
+   device's health to the API (see [Health Reports](#health-reports))
 2. **Polls** `GET /nodes?kind=job&state=available&data.runtime=<lab>&data.platform=<p>`
    for each healthy platform, one job per platform at a time; with `pool` set,
    then also `data.runtime=<pool>`. A pool lets several labs offering the same
@@ -179,7 +180,12 @@ it and only needs outbound HTTPS to the KernelCI instance. With
 
 - **Platforms** are the `device=<platform>` tags of the coordinator's places
   (openwrt-tests sets them from `labnet.yaml`). `platforms` in the config
-  restricts that list and adds local QEMU targets.
+  adds local QEMU targets; hardware platforms in it restrict the list.
+- **Maintenance:** a place tagged `maintenance=<reason>`
+  (`labgrid-client -p <place> set-tags maintenance=new_psu`) gets no jobs or
+  health checks; a device whose places are all in maintenance is reported as
+  failed (`maintenance: <reason>`). `set-tags maintenance=` (empty value)
+  removes the tag again.
 - **Before claiming** a job for a hardware platform, the agent reserves a place
   with `device=<platform>` and locks it. If no place is free within
   `reserve_timeout` (someone is debugging on the board), the job stays
@@ -198,8 +204,9 @@ library, pinned to the same labgrid as openwrt-tests.
 ## Health Checks
 
 Similar to LAVA, the agent can run periodic health checks with a known-good
-image. Results are kept local (state file) and only gate job execution: jobs
-for a `bad` device are left `available` for other labs.
+image. Results gate job execution (jobs for a `bad` device are left
+`available` for other labs) and are reported to the API, where they are the
+server's list of the lab's devices (see [Health Reports](#health-reports)).
 
 ### Health Check Configuration
 
@@ -270,8 +277,42 @@ are checked. See [`examples/health_checks/`](examples/health_checks/).
 | `bad` | Last health check failed - device is offline |
 | `unknown` | No health check has run yet |
 
-When a device is in `bad` state, the agent skips jobs for that device until
-the next health check passes.
+When a device is `bad` (or all its places are in maintenance), the agent
+skips jobs for that device (`bad`: until the next health check passes).
+
+### Health Reports
+
+Each device's health goes to the API as a top-level job node (no parent),
+after every health check, and otherwise when it changes and at least every
+12 hours (a heartbeat; the OpenWrt CI server forgets devices without a
+report for 48 hours):
+
+```json
+{
+  "kind": "job",
+  "name": "healthcheck",
+  "path": ["healthcheck"],
+  "state": "done",
+  "result": "pass",
+  "artifacts": {"test_log": "http://storage/logs/<lab>/healthcheck/openwrt_one/20261102T080000Z/console_main"},
+  "data": {
+    "platform": "openwrt_one",
+    "runtime": "<lab>",
+    "device": "labgrid-aparcar-openwrt_one",
+    "misc": {
+      "healthcheck": {"firmware": "https://downloads.openwrt.org/releases/25.12.5/...",
+                      "release": "25.12.5", "tests": "test_base.py::test_shell test_base.py::test_ssh",
+                      "duration": 74, "passed": 2, "failed": 0, "total": 2}
+    }
+  }
+}
+```
+
+`result` is `pass` (the check passed), `fail` (it failed, or the device is in
+maintenance) or `skip` (no check possible: health checks off, no golden image,
+not checked yet); `data.error_msg` says why for `fail` and `skip`.
+`misc.healthcheck` is only set when a check ran. Maestro sets `owner` to the
+lab's API user, so the server can tell which lab sent a report.
 
 ## Job Format
 
