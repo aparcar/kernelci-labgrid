@@ -112,6 +112,35 @@ async def test_health_check_reports_result(agent, posted, monkeypatch):
     assert len(posted) == 1
 
 
+async def test_health_check_logs_only_the_last_run(agent, posted, monkeypatch):
+    """labgrid appends to its console log: the reused workdir starts empty."""
+    agent.health_checks = {}
+    seen = []
+
+    async def golden(config):
+        return RELEASE_URL, None
+
+    async def fetch(url, sha256, dest):
+        return dest / "fw.img.gz"
+
+    async def pytest_run(**kwargs):
+        outdir = kwargs["outdir"]
+        outdir.mkdir(parents=True, exist_ok=True)
+        log = outdir / "console_main"
+        with log.open("a") as f:
+            f.write(f"run {len(seen)}\n")
+        seen.append(log.read_text())
+        return TestResult(passed=1, total=1, returncode=0)
+
+    monkeypatch.setattr(agent, "_golden_image", golden)
+    monkeypatch.setattr(agent, "_fetch_firmware", fetch)
+    monkeypatch.setattr(agent, "_run_pytest", pytest_run)
+    await agent._check_health()
+    agent._device_health["qemu_x86-64"].last_check -= timedelta(days=30)
+    await agent._check_health()
+    assert seen == ["run 0\n", "run 1\n"]
+
+
 async def test_no_golden_image_reports_unknown(agent, posted, monkeypatch):
     agent.health_checks = {}
 

@@ -644,6 +644,11 @@ class LabgridAgent:
             firmware = await self._fetch_firmware(
                 firmware_url, sha256, self.artifact_dir / "firmware")
 
+            # The workdir is reused for every check of the device and labgrid
+            # appends to its console log: start empty so the uploaded logs are
+            # this run's only
+            shutil.rmtree(workdir, ignore_errors=True)
+
             result = await self._run_pytest(
                 target_yaml=target_yaml,
                 firmware=firmware,
