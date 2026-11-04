@@ -1369,6 +1369,12 @@ class LabgridAgent:
                         "duration": duration,
                         "message": message,
                         "log": self._testcase_log(testcase),
+                        # record_property values (strings; lists as JSON)
+                        "properties": {
+                            prop.get("name"): prop.get("value", "")
+                            for prop in testcase.findall("properties/property")
+                            if prop.get("name")
+                        },
                     })
 
             result.passed = result.total - result.failed - result.errors - result.skipped
@@ -1437,6 +1443,8 @@ class LabgridAgent:
                 data: dict[str, Any] = {**node_data, "misc": {"duration_ms": int(tc["duration"] * 1000)}}
                 if tc.get("message"):
                     data["error_msg"] = tc["message"][:1000]
+                if tc.get("properties"):
+                    data["misc"]["properties"] = tc["properties"]
                 leaves.append({"node": {
                     "name": tc["name"],
                     "kind": "test",

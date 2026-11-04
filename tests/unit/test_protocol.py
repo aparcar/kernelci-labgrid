@@ -143,6 +143,16 @@ class TestBuildHierarchy:
                                       "junit": "http://storage/results.xml"}
         assert ssh["artifacts"] == {}  # no log of its own: KCIDB uses the job's
 
+    def test_properties(self, agent):
+        measured = {**case("base", "test_free_memory", "pass"), "properties": {"used_memory": "38"}}
+        result = TestResult(passed=2, total=2, returncode=0,
+                            test_cases=[measured, case("base", "test_shell", "pass")])
+        h = agent._build_hierarchy(JOB, result, {})
+
+        memory, shell = (c["node"] for c in h["child_nodes"][0]["child_nodes"])
+        assert memory["data"]["misc"]["properties"] == {"used_memory": "38"}
+        assert "properties" not in shell["data"]["misc"]
+
     def test_infra_error_code(self, agent):
         h = agent._build_hierarchy(JOB, TestResult(returncode=2), {})
         assert h["node"]["result"] == "incomplete"

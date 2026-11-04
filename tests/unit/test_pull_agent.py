@@ -252,6 +252,26 @@ CONSOLE    SerialDriver: root@OpenWrt:~# ubus call system board
         assert "Captured Err" not in shell["log"]
         assert ubus["log"].index("ubus call system board") < ubus["log"].index("AssertionError: boom")
 
+    def test_parse_properties(self, agent, tmp_path):
+        """record_property values per test (junit_family=xunit1)."""
+        junit_xml = tmp_path / "results.xml"
+        junit_xml.write_text("""<?xml version="1.0" encoding="utf-8"?>
+<testsuite name="pytest" tests="2" errors="0" failures="0" skipped="0" time="2.0">
+    <testcase classname="tests.test_system_health.TestSystemHealth" name="test_memory_usage" time="1.0">
+        <properties>
+            <property name="memory_used_mb" value="42" />
+            <property name="probe_lan_ipv6" value="[&quot;fd00::2/64&quot;]" />
+        </properties>
+    </testcase>
+    <testcase classname="tests.test_base" name="test_shell" time="1.0" />
+</testsuite>
+""")
+
+        memory, shell = agent._parse_junit_xml(junit_xml).test_cases
+
+        assert memory["properties"] == {"memory_used_mb": "42", "probe_lan_ipv6": '["fd00::2/64"]'}
+        assert shell["properties"] == {}
+
 
 class TestMapOutcome:
     """Tests for pytest/JUnit outcome mapping."""
