@@ -1257,9 +1257,11 @@ class LabgridAgent:
             f"--lg-log={outdir}",
             f"--junit-xml={junit_xml}",
             # Each test's log records (its console lines) and output in the
-            # JUnit XML: the per-test logs
+            # JUnit XML: the per-test logs. --log-level (not --log-cli-level)
+            # captures the CONSOLE records for the XML without also streaming
+            # every serial line into pytest.log; --lg-log keeps the raw console.
             "-o", "junit_logging=all",
-            "--log-cli-level=CONSOLE",
+            "--log-level=CONSOLE",
             "--tb=short",
             "-v",
             "-p", "no:cacheprovider",
