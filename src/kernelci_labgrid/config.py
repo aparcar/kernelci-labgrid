@@ -2,7 +2,8 @@
 
 Precedence (later wins): defaults < config file < --env-file < environment
 < command line. Environment variables: LAB_NAME, KCI_API_URL, LAB_API_TOKEN,
-KCI_STORAGE_URL, LAB_STORAGE_TOKEN, LG_COORDINATOR and the paths LABGRID_TESTS_DIR,
+KCI_STORAGE_URL, LAB_STORAGE_TOKEN, LG_COORDINATOR, LABGRID_TESTS_REPO,
+LABGRID_TESTS_REF, LABGRID_CONTAINER_IMAGE and the paths LABGRID_TESTS_DIR,
 LABGRID_TARGETS_DIR, LABGRID_STRATEGIES_DIR, LABGRID_ARTIFACT_DIR, LABGRID_HEALTH_CHECKS_DIR,
 LABGRID_HEALTH_STATE_FILE. Example config (keys before the [api]/[storage] tables, as
 TOML assigns later keys to the table above them):
@@ -32,11 +33,23 @@ TOML assigns later keys to the table above them):
 
     [health_checks.rpi-4]
     enabled = false
+
+    # Instead of tests_dir etc.: a git repository the agent keeps up to date,
+    # and/or a podman image pytest runs in
+    [tests]
+    repo = "https://github.com/aparcar/openwrt-tests.git"
+    ref = "main"
+    # update_interval = 300
+
+    [container]
+    image = "localhost/labgrid-agent"
+    # command = "podman", network = "host", args = []
 """
 
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -74,6 +87,23 @@ DEFAULTS: dict[str, Any] = {
     "max_jobs": None,
     # Shared runtime several labs take jobs from (e.g. "openwrt-labs")
     "pool": None,
+    # [tests]: the test suite from a git repository (instead of tests_dir etc.)
+    "tests_repo": None,
+    "tests_ref": None,
+    "tests_update_interval": 300,
+    # [container]: run pytest in a container image (podman)
+    "container_image": None,
+    "container_command": None,
+    "container_network": None,
+    "container_args": [],
+}
+
+# Tables of the config file and their keys: [tests] repo = ... is tests_repo
+TABLES = {
+    "api": ("url", "token"),
+    "storage": ("url", "token"),
+    "tests": ("repo", "ref", "update_interval"),
+    "container": ("image", "command", "network", "args"),
 }
 
 # Settings that are paths; relative ones are resolved against the config file
@@ -97,6 +127,9 @@ ENV_KEYS = {
     "coordinator": ("LG_COORDINATOR",),
     "pool": ("LAB_POOL",),
     "max_jobs": ("LAB_MAX_JOBS",),
+    "tests_repo": ("LABGRID_TESTS_REPO",),
+    "tests_ref": ("LABGRID_TESTS_REF",),
+    "container_image": ("LABGRID_CONTAINER_IMAGE",),
 }
 
 SECRET_KEYS = ("api_token", "storage_token")
@@ -130,14 +163,21 @@ def load_config(path: Path) -> dict[str, Any]:
         for key, value in source.items():
             if key in DEFAULTS:
                 settings[key] = value
-    for table in ("api", "storage"):
-        for key in ("url", "token"):
-            if key in data.get(table, {}):
-                settings[f"{table}_{key}"] = data[table][key]
+    for table, keys in TABLES.items():
+        values = data.get(table, {})
+        if not isinstance(values, dict):
+            raise ValueError(f"{path}: [{table}] must be a table")
+        for key in keys:
+            if key in values:
+                settings[f"{table}_{key}"] = values[key]
+        if table in ("tests", "container") and (unknown := set(values) - set(keys)):
+            raise ValueError(f"{path}: unknown settings in [{table}]: {', '.join(sorted(unknown))}")
 
-    unknown = set(data) - set(DEFAULTS) - {"agent", "api", "storage"}
+    unknown = set(data) - set(DEFAULTS) - {"agent", *TABLES}
     if unknown:
         raise ValueError(f"{path}: unknown settings: {', '.join(sorted(unknown))}")
+    if isinstance(settings.get("container_args"), str):
+        settings["container_args"] = shlex.split(settings["container_args"])
     if isinstance(settings.get("platforms"), str):
         settings["platforms"] = [settings["platforms"]]
     if settings.get("health_checks") is True:

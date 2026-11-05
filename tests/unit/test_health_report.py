@@ -87,7 +87,7 @@ async def test_report_state_survives_restarts(tmp_path):
 async def test_health_check_reports_result(agent, posted, monkeypatch):
     agent.health_checks = {}
 
-    async def golden(config):
+    async def golden(config, suite=None):
         return RELEASE_URL, None
 
     async def fetch(url, sha256, dest):
@@ -117,7 +117,7 @@ async def test_health_check_logs_only_the_last_run(agent, posted, monkeypatch):
     agent.health_checks = {}
     seen = []
 
-    async def golden(config):
+    async def golden(config, suite=None):
         return RELEASE_URL, None
 
     async def fetch(url, sha256, dest):
@@ -144,7 +144,7 @@ async def test_health_check_logs_only_the_last_run(agent, posted, monkeypatch):
 async def test_no_golden_image_reports_unknown(agent, posted, monkeypatch):
     agent.health_checks = {}
 
-    async def golden(config):
+    async def golden(config, suite=None):
         raise RuntimeError("openwrt_one is in no release")
 
     monkeypatch.setattr(agent, "_golden_image", golden)

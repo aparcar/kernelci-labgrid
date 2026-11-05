@@ -56,6 +56,21 @@ targets_dir = "openwrt-tests/targets"     # default: <tests_dir>/../targets
 url = "https://api.example.org/latest"
 token = "<lab API token>"
 
+# Optional: the test suite from a git repository the agent keeps up to date
+# (replaces tests_dir, targets_dir, strategies_dir), and/or pytest in a
+# podman container that gets none of the agent's tokens. See README.md
+# ("Tests repository and container"), also for what the container does not
+# protect against.
+# [tests]
+# repo = "https://github.com/aparcar/openwrt-tests.git"
+# ref = "main"                 # branch, tag or commit
+# update_interval = 300        # seconds; 0: only at start
+#
+# [container]
+# image = "localhost/labgrid-agent"   # podman build -t labgrid-agent .
+# network = "host"
+# args = ["--userns=keep-id"]
+
 # kernelci-storage for log uploads (optional; without it logs stay local)
 [storage]
 url = "https://files.example.org/"

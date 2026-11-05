@@ -119,6 +119,8 @@ labgrid-agent \
 | `LAB_POOL` | `pool` |
 | `LAB_MAX_JOBS` | `max_jobs` |
 | `LABGRID_TESTS_DIR`, `LABGRID_TARGETS_DIR`, `LABGRID_STRATEGIES_DIR` | test suite paths |
+| `LABGRID_TESTS_REPO`, `LABGRID_TESTS_REF` | `[tests]` `repo`, `ref` |
+| `LABGRID_CONTAINER_IMAGE` | `[container]` `image` |
 | `LABGRID_ARTIFACT_DIR`, `LABGRID_HEALTH_CHECKS_DIR`, `LABGRID_HEALTH_STATE_FILE` | agent paths |
 | `LABGRID_AGENT_CONFIG` | config file, if no `--config` |
 
@@ -149,6 +151,10 @@ labgrid-agent \
 | `--health-checks-dir`, `-c` | Directory with health check TOML files, one per device |
 | `--health-state-file`, `-s` | JSON file to persist device health state |
 | `--no-health-checks` | No health checks for all platforms (only `--health-checks-dir` ones) |
+| `--tests-repo`, `--tests-ref` | git repository (and branch, tag or commit) of the test suite, instead of `--tests-dir` (see [Tests repository and container](#tests-repository-and-container)) |
+| `--tests-update-interval` | Seconds between fetches of the tests repository (default: 300; 0: only at start) |
+| `--container-image` | Run pytest in this podman image |
+| `--container-command`, `--container-network`, `--container-arg` | Container engine (default: `podman`), its network (default: `host`), extra `podman run` options (repeatable) |
 | `--debug`, `-d` | Enable debug logging |
 
 ## How It Works
@@ -165,7 +171,8 @@ labgrid-agent \
    kernelci/pullab_cloud, until kernelci-api has an atomic claim)
 4. **Fetches the job definition** from `artifacts.job_definition`, downloads the
    firmware and verifies its sha256
-5. **Runs pytest** in `tests_dir`, with the agent's own Python:
+5. **Runs pytest** in `tests_dir`, with the agent's own Python (or in a
+   container, see [Tests repository and container](#tests-repository-and-container)):
    ```bash
    python -m pytest <selection> --lg-env <run>/env/targets/<platform>.yaml \
        --firmware <image> --lg-log=<out> --junit-xml=<out>/results.xml \
@@ -399,6 +406,111 @@ instead.
 
 [`examples/docker/`](examples/docker/) is a complete Docker Compose setup
 with a coordinator, a QEMU exporter and the agent.
+
+## Tests repository and container
+
+Instead of a test suite on disk, the agent can be given a git repository,
+which it keeps up to date, and a podman image, in which it runs pytest:
+
+```toml
+[tests]
+repo = "https://github.com/aparcar/openwrt-tests.git"
+ref = "main"              # branch, tag or commit (default: HEAD)
+# update_interval = 300   # seconds between fetches; 0: only at start
+
+[container]
+image = "localhost/labgrid-agent"   # e.g. built from this repository's Dockerfile
+# command = "podman"      # or docker
+# network = "host"
+# args = ["--userns=keep-id", "--memory=4g"]
+```
+
+(also `--tests-repo`, `--tests-ref`, `--tests-update-interval`,
+`--container-image`, `--container-command`, `--container-network`,
+`--container-arg`, and `LABGRID_TESTS_REPO`, `LABGRID_TESTS_REF`,
+`LABGRID_CONTAINER_IMAGE`). Both work on their own: a repository without a
+container runs in the agent's environment, a container without a repository
+runs the local `tests_dir`.
+
+**Tests repository.** The repository has the openwrt-tests layout
+(`tests/`, `targets/`, `strategies/`); `tests_dir`, `targets_dir` and
+`strategies_dir` are ignored. The agent fetches `ref` at start (and refuses
+to start if that fails) and then every `update_interval` seconds, and
+extracts each new commit into a read-only snapshot
+`<artifact_dir>/tests-repo/<commit>/`. Jobs and health checks use the
+snapshot that was current when they started, so an update never changes the
+files under a running test; snapshots no longer in use are removed. If a
+later fetch fails, the agent keeps the snapshot it has. Job nodes and health
+reports carry `tests_repo` and `tests_revision` (the commit), so every result
+says which version of the suite produced it. Updating the lab's tests is a
+push to the repository (or moving the tag `ref` points at) - no login to the
+lab host.
+
+**Container.** pytest runs as
+
+```bash
+podman run --rm --name labgrid-agent-<id> --network host \
+    --cap-drop=all --security-opt=no-new-privileges --workdir <snapshot>/tests \
+    --volume <snapshot>:<snapshot>:ro \
+    --volume <firmware>:<firmware>:ro --volume <out>:<out>:rw \
+    --device /dev/kvm --env LG_IMAGE=<firmware> --env LG_COORDINATOR=… --env LG_PLACE=… \
+    <args> --entrypoint python3 <image> -m pytest <selection> --lg-env … --firmware …
+```
+
+Paths are mounted where they are on the host, so the command line, the
+staged target file's symlinks and the logs are the same as without a
+container. A tests repository's snapshot is mounted whole (its
+`pyproject.toml` holds pytest's settings); a local suite as its three
+directories. The suite is read-only in the container, so `uv run` (which
+creates a `.venv` there) doesn't work: the image's environment runs the
+tests. The image needs labgrid (the fork in `pyproject.toml`), pytest,
+pytest-check, pytest-harvest and QEMU: the [`Dockerfile`](Dockerfile) image
+has all of them (`podman build -t labgrid-agent .`). `pytest_command` is the
+command in the container (default `python3 -m pytest`). On timeout or stop
+the agent removes the container (`podman rm --force`), since killing
+`podman run` alone leaves it running. The agent itself runs on the host
+(`uv sync`, systemd, see below) and needs its `labgrid-client` for power
+off; running the agent in a container and the tests in another one is not
+supported, as the mounted paths would be the agent container's.
+
+### What the container protects, and what not
+
+The test suite is code that runs in your lab, and with a tests repository
+it is code that whoever can push to `ref` can change. The container narrows
+what that code can reach:
+
+- It gets **none of the agent's secrets**: the environment holds only
+  `LG_*` variables, not the API and storage tokens, and the config file is
+  not mounted. A test can't report fake results or upload to storage on its
+  own.
+- It sees **only its own run** of the **host's files**: the read-only suite
+  snapshot and firmware, and its output directory, not other jobs' outputs,
+  the health state or your home directory. It can't modify the suite later
+  runs use, nor the agent.
+- It has **no extra privileges**: all capabilities dropped, no setuid; with
+  rootless podman, root in the container is the agent's user on the host.
+- The **code is pinned and recorded**: each run uses one commit, named in
+  its results.
+
+It does not isolate the lab:
+
+- With `network = "host"` (needed to reach the coordinator, the exporters
+  and the DUTs as labgrid does) the tests reach **everything the host
+  reaches**: the labgrid coordinator has no authentication, so a test can
+  acquire, power-cycle or flash **any place** of the coordinator, not only
+  the one leased for its job, and it can reach the DUT networks, the lab LAN
+  and the internet. A dedicated podman network, or firewall rules for the
+  container's traffic, narrow that.
+- The **devices** themselves are fully in the tests' hands (that's the
+  point): a malicious test can brick or misconfigure the DUT.
+- `/dev/kvm` and the kernel are shared, as with any container.
+
+So: pin `ref` to a protected branch or a tag that only trusted people can
+move, and treat push access to the tests repository like shell access to
+the lab's devices. The container makes a bad commit unable to steal the
+lab's KernelCI credentials or to persist on the lab host, but not unable to
+mess with the lab's devices. Never let jobs choose the repository: it is
+lab configuration, deliberately not part of the job definition.
 
 ## Systemd Service
 

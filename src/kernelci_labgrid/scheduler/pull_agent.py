@@ -47,9 +47,11 @@ import sys
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any
 
 import aiohttp
@@ -69,6 +71,7 @@ from kernelci_labgrid.labgrid import (
     kill_group,
     spawn,
 )
+from kernelci_labgrid.suite import Container, Suite, TestsRepo
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +283,14 @@ class LabgridAgent:
         strategies_dir: str | Path | None = None,
         reserve_timeout: int = 60,
         max_jobs: int | None = None,
+        # Test suite from a git repository, run in a container
+        tests_repo: str | None = None,
+        tests_ref: str | None = None,
+        tests_update_interval: int = 300,
+        container_image: str | None = None,
+        container_command: str | None = None,
+        container_network: str | None = None,
+        container_args: list[str] | None = None,
     ):
         """Initialize the agent.
 
@@ -319,14 +330,32 @@ class LabgridAgent:
                 any lab offering the platform); claiming moves a job to this lab
             max_jobs: At most this many jobs at once (e.g. QEMU on a small
                 machine); default: one per platform, no overall limit
+            tests_repo: git URL of the test suite (openwrt-tests layout:
+                tests/, targets/, strategies/). Replaces tests_dir,
+                targets_dir and strategies_dir: the agent fetches tests_ref
+                every tests_update_interval seconds (0: only at start) into a
+                read-only snapshot per commit below artifact_dir/tests-repo
+            tests_ref: branch, tag or commit of tests_repo (default: HEAD)
+            container_image: run pytest in this podman image (which brings
+                labgrid, pytest and QEMU) instead of the agent's environment
+            container_command: podman (default) or docker
+            container_network: the container's network (default: host)
+            container_args: more `podman run` options, e.g. --userns=keep-id
         """
         self.api_url = api_url.rstrip("/")
         self.api_token = api_token
         self.lab_name = lab_name
-        self.tests_dir = Path(tests_dir)
-        self.targets_dir = Path(targets_dir) if targets_dir else self.tests_dir.parent / "targets"
-        self.strategies_dir = (Path(strategies_dir) if strategies_dir
-                               else self.targets_dir.parent / "strategies")
+        self.artifact_dir = Path(artifact_dir or tempfile.mkdtemp(prefix="kci-labgrid-"))
+        self.tests_repo = (TestsRepo(tests_repo, tests_ref or "HEAD",
+                                     self.artifact_dir / "tests-repo",
+                                     update_interval=tests_update_interval)
+                           if tests_repo else None)
+        # The current suite; from a tests repository once it is fetched (start)
+        self.suite: Suite | None = (None if self.tests_repo
+                                    else Suite.local(tests_dir, targets_dir, strategies_dir))
+        self.container = (Container(container_image, container_command or "podman",
+                                    container_network or "host", tuple(container_args or ()))
+                          if container_image else None)
         self.storage_url = storage_url.rstrip("/") if storage_url else None
         self.storage_token = storage_token
         # Configured platforms: an allow-list for discovered hardware
@@ -338,14 +367,18 @@ class LabgridAgent:
         self.pool = pool or None
         if not labgrid_command:
             labgrid_command = shlex.join([str(Path(sys.executable).parent / "labgrid-client")])
-        self._labgrid = (Coordinator(coordinator, labgrid_command, self.tests_dir)
+        # cwd of labgrid-client (power off); snapshots come and go
+        self._labgrid = (Coordinator(coordinator, labgrid_command,
+                                     self.artifact_dir if self.tests_repo else self.tests_dir)
                          if coordinator else None)
         self._places: list[Place] = []
         self._job_places: dict[str, str] = {}
+        self._job_suites: dict[str, Suite] = {}
+        # In a container: its own python (the agent's isn't there)
         self.pytest_command = (shlex.split(pytest_command) if pytest_command
+                               else ["python3", "-m", "pytest"] if self.container
                                else [sys.executable, "-m", "pytest"])
         self.poll_interval = poll_interval
-        self.artifact_dir = Path(artifact_dir or tempfile.mkdtemp(prefix="kci-labgrid-"))
         self.default_timeout = default_timeout
         self.worker_id = f"{lab_name}@{socket.gethostname()}"
 
@@ -366,6 +399,47 @@ class LabgridAgent:
         self._health_defaults: dict[str, Any] = {}
         self._device_health: dict[str, DeviceHealth] = {}
 
+    # The current suite's directories (a running job keeps its own suite)
+    @property
+    def tests_dir(self) -> Path:
+        return self._current_suite().tests_dir
+
+    @property
+    def targets_dir(self) -> Path:
+        return self._current_suite().targets_dir
+
+    @property
+    def strategies_dir(self) -> Path:
+        return self._current_suite().strategies_dir
+
+    def _current_suite(self) -> Suite:
+        if not self.suite:
+            raise RuntimeError("Tests repository not fetched yet")
+        return self.suite
+
+    @contextmanager
+    def _use_suite(self) -> Iterator[Suite]:
+        """The current suite for one run: a tests repository snapshot stays
+        on disk (and unchanged) until the run ends."""
+        if self.tests_repo:
+            with self.tests_repo.use() as suite:
+                yield suite
+        else:
+            yield self._current_suite()
+
+    async def _update_suite(self) -> None:
+        """Fetch the tests repository if due; on errors keep the current
+        suite (raises only if there is none yet)."""
+        if not (self.tests_repo and self.tests_repo.due()):
+            return
+        try:
+            self.suite = await self.tests_repo.update()
+        except Exception as e:
+            if not self.suite:
+                raise
+            logger.warning(f"Updating tests repository failed, keeping "
+                           f"{self.suite.revision[:12]}: {e}")
+
     async def __aenter__(self) -> "LabgridAgent":
         await self.start()
         return self
@@ -376,12 +450,19 @@ class LabgridAgent:
     async def start(self) -> None:
         """Start the agent."""
         logger.info(f"Starting agent for lab: {self.lab_name}")
+        self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        if self.tests_repo:
+            logger.info(f"Tests repository: {self.tests_repo.url} ({self.tests_repo.ref}), "
+                        + (f"updated every {self.tests_repo.update_interval}s"
+                           if self.tests_repo.update_interval else "fetched once"))
+            await self._update_suite()
+        if self.container:
+            logger.info(f"Tests run in container image {self.container.image} "
+                        f"({self.container.command}, network {self.container.network})")
         logger.info(f"Tests directory: {self.tests_dir}")
         logger.info(f"Targets directory: {self.targets_dir}")
         logger.info(f"Strategies directory: {self.strategies_dir}"
                     f"{'' if self.strategies_dir.is_dir() else ' (missing)'}")
-
-        self.artifact_dir.mkdir(parents=True, exist_ok=True)
 
         if self._labgrid:
             logger.info(f"labgrid coordinator: {self._labgrid.address}")
@@ -469,6 +550,9 @@ class LabgridAgent:
 
         while self._running:
             try:
+                # New commits of the tests repository (running jobs keep theirs)
+                await self._update_suite()
+
                 # Run health checks if due
                 await self._check_health()
 
@@ -610,6 +694,11 @@ class LabgridAgent:
     async def _run_health_check(self, device: str, config: HealthCheckConfig) -> bool:
         """Run a health check for a device and report it; False if it was
         postponed (no free place)."""
+        with self._use_suite() as suite:
+            return await self._run_health_check_with(device, config, suite)
+
+    async def _run_health_check_with(self, device: str, config: HealthCheckConfig,
+                                     suite: Suite) -> bool:
         health = self._device_health.get(device, DeviceHealth(device=device))
         workdir = self.artifact_dir / f"health-{device}"
 
@@ -617,7 +706,7 @@ class LabgridAgent:
         # file, downloads.openwrt.org) keep its state, report it as skipped
         # (e.g. a target in no release yet) and retry next poll
         try:
-            firmware_url, sha256 = await self._golden_image(config)
+            firmware_url, sha256 = await self._golden_image(config, suite)
         except Exception as e:
             logger.error(f"Health check for {device} skipped: no golden image: {e}")
             await self._report_health(device, "skip", f"no golden image: {e}", heartbeat=True)
@@ -635,7 +724,7 @@ class LabgridAgent:
         started = datetime.now()
 
         try:
-            target_yaml = self.targets_dir / config.target
+            target_yaml = suite.targets_dir / config.target
             if not target_yaml.exists():
                 raise RuntimeError(f"Target not found: {target_yaml}")
 
@@ -656,6 +745,7 @@ class LabgridAgent:
                 timeout=config.timeout,
                 outdir=workdir,
                 extra_env=extra_env,
+                suite=suite,
             )
 
             # Update health state
@@ -692,6 +782,7 @@ class LabgridAgent:
             "release": self._release_of(firmware_url),
             "tests": config.test_path,
             "duration": round((datetime.now() - started).total_seconds()),
+            **suite.info(),
         }
         if result:
             details.update(passed=result.passed, failed=result.failed, total=result.total)
@@ -755,13 +846,15 @@ class LabgridAgent:
         health.last_report = now
         self._save_health_state()
 
-    async def _golden_image(self, config: HealthCheckConfig) -> tuple[str, str | None]:
+    async def _golden_image(self, config: HealthCheckConfig,
+                            suite: Suite | None = None) -> tuple[str, str | None]:
         """(firmware URL, sha256): explicit in the config, else the target
         file's image in its healthcheck_version, the configured release or
         the current stable release."""
         if config.golden_image.get("firmware"):
             return config.golden_image["firmware"], config.golden_image.get("sha256")
-        image = TargetImage.from_target_file(self.targets_dir / config.target)
+        targets_dir = suite.targets_dir if suite else self.targets_dir
+        image = TargetImage.from_target_file(targets_dir / config.target)
         release = image.release(config.release)
         if not release:
             release = (await self._fetch_json(VERSIONS_URL))["stable_version"]
@@ -1002,15 +1095,23 @@ class LabgridAgent:
 
     async def _execute_job(self, job: dict[str, Any], lease: Lease | None = None) -> None:
         """Execute a test job (on a reserved, locked labgrid place if leased)."""
+        logger.info(f"Executing: {job.get('name', 'unknown')} ({job['id']}) on "
+                    f"{job.get('data', {}).get('platform', '')}")
+        with self._use_suite() as suite:
+            self._job_suites[job["id"]] = suite
+            await self._execute_job_with(job, lease, suite)
+
+    async def _execute_job_with(self, job: dict[str, Any], lease: Lease | None,
+                                suite: Suite) -> None:
         node_id = job["id"]
         job_name = job.get("name", "unknown")
         platform = job.get("data", {}).get("platform", "")
         outdir = self.artifact_dir / node_id
-
-        logger.info(f"Executing: {job_name} ({node_id}) on {platform}")
+        if suite.revision:
+            logger.info(f"{job_name} ({node_id}): tests {suite.revision[:12]}")
 
         try:
-            target_yaml = self._find_target_yaml(platform)
+            target_yaml = self._find_target_yaml(platform, suite)
             if not target_yaml:
                 raise RuntimeError(f"No target YAML found for platform: {platform}")
 
@@ -1034,6 +1135,7 @@ class LabgridAgent:
                 timeout=test.get("timeout_s", self.default_timeout),
                 outdir=outdir,
                 extra_env=extra_env,
+                suite=suite,
             )
 
             await self._report_results(job, result)
@@ -1055,6 +1157,7 @@ class LabgridAgent:
             if lease:
                 await self._labgrid.release(lease)
             self._job_places.pop(node_id, None)
+            self._job_suites.pop(node_id, None)
             self._current_jobs.discard(node_id)
             self._busy_platforms.discard(platform)
 
@@ -1187,14 +1290,15 @@ class LabgridAgent:
 
     # ==================== Test Execution ====================
 
-    def _find_target_yaml(self, platform: str) -> Path | None:
+    def _find_target_yaml(self, platform: str, suite: Suite | None = None) -> Path | None:
         """Find labgrid target YAML for platform."""
+        targets_dir = (suite or self._current_suite()).targets_dir
         # Try exact match first
         candidates = [
-            self.targets_dir / f"{platform}.yaml",
-            self.targets_dir / f"{platform}.yml",
-            self.targets_dir / f"qemu-{platform}.yaml",
-            self.targets_dir / f"{platform.replace('-', '_')}.yaml",
+            targets_dir / f"{platform}.yaml",
+            targets_dir / f"{platform}.yml",
+            targets_dir / f"qemu-{platform}.yaml",
+            targets_dir / f"{platform.replace('-', '_')}.yaml",
         ]
 
         for path in candidates:
@@ -1202,25 +1306,25 @@ class LabgridAgent:
                 return path
 
         # Try glob match
-        for yaml_file in self.targets_dir.glob("*.yaml"):
+        for yaml_file in targets_dir.glob("*.yaml"):
             if platform in yaml_file.stem:
                 return yaml_file
 
         return None
 
-    def _selection(self, pytest_args: str) -> list[str]:
+    def _selection(self, pytest_args: str, suite: Suite | None = None) -> list[str]:
         """Job selection relative to tests_dir; empty = all tests.
 
         Jobs created against the openwrt-tests repo layout say `tests/...`;
         strip that prefix when tests_dir itself has no tests/ subdirectory.
         """
         args = shlex.split(pytest_args or "")
-        if not (self.tests_dir / "tests").is_dir():
+        if not ((suite or self._current_suite()).tests_dir / "tests").is_dir():
             args = [a[len("tests/"):] if a.startswith("tests/") else a for a in args]
             args = [a for a in args if a not in ("tests", "")]
         return args or ["."]
 
-    def _stage_target(self, target_yaml: Path, stage: Path) -> Path:
+    def _stage_target(self, target_yaml: Path, stage: Path, suite: Suite | None = None) -> Path:
         """Symlink the target file and strategies into a per-run directory.
 
         Target files import strategies relative to themselves
@@ -1233,7 +1337,8 @@ class LabgridAgent:
         targets.mkdir(parents=True, exist_ok=True)
         staged = targets / target_yaml.name
         strategies = stage / "strategies"
-        for link, dest in ((staged, target_yaml.resolve()), (strategies, self.strategies_dir.resolve())):
+        strategies_dir = (suite or self._current_suite()).strategies_dir
+        for link, dest in ((staged, target_yaml.resolve()), (strategies, strategies_dir.resolve())):
             if link.is_symlink() or link.exists():
                 link.unlink()
             if dest.exists():
@@ -1248,16 +1353,19 @@ class LabgridAgent:
         timeout: int,
         outdir: Path,
         extra_env: dict[str, str] | None = None,
+        suite: Suite | None = None,
     ) -> TestResult:
-        """Run pytest with the labgrid environment in the tests repo."""
+        """Run pytest with the labgrid environment in the tests repo (in
+        the container, if one is configured)."""
+        suite = suite or self._current_suite()
         outdir.mkdir(parents=True, exist_ok=True)
         junit_xml = outdir / "results.xml"
         pytest_log = outdir / "pytest.log"
 
         cmd = [
             *self.pytest_command,
-            *self._selection(pytest_args),
-            "--lg-env", str(self._stage_target(target_yaml, outdir / "env")),
+            *self._selection(pytest_args, suite),
+            "--lg-env", str(self._stage_target(target_yaml, outdir / "env", suite)),
             "--firmware", str(firmware),
             f"--lg-log={outdir}",
             f"--junit-xml={junit_xml}",
@@ -1272,9 +1380,22 @@ class LabgridAgent:
             "-p", "no:cacheprovider",
         ]
 
-        env = child_env()
-        env["LG_IMAGE"] = str(firmware)
-        env.update(extra_env or {})
+        container = None
+        if self.container:
+            # Only what this run needs, and none of the agent's environment
+            # (API and storage tokens)
+            container = f"labgrid-agent-{uuid.uuid4().hex[:12]}"
+            cmd = self.container.run_command(
+                container, cmd, workdir=suite.tests_dir,
+                mounts=[*((p, False) for p in suite.mounts()), (firmware, False), (outdir, True)],
+                env={"LG_IMAGE": str(firmware), "PYTHONUNBUFFERED": "1",
+                     # the suite is read-only
+                     "PYTHONDONTWRITEBYTECODE": "1", **(extra_env or {})})
+            env = child_env()
+        else:
+            env = child_env()
+            env["LG_IMAGE"] = str(firmware)
+            env.update(extra_env or {})
 
         logger.info(f"Running: {shlex.join(cmd)}")
 
@@ -1287,7 +1408,7 @@ class LabgridAgent:
                     *cmd,
                     stdout=log,
                     stderr=asyncio.subprocess.STDOUT,
-                    cwd=self.tests_dir,
+                    cwd=suite.tests_dir,
                     env=env,
                 )
                 try:
@@ -1301,6 +1422,10 @@ class LabgridAgent:
                     raise
                 else:
                     await kill_group(proc)  # exited: just forget it
+                finally:
+                    # Killing `podman run` doesn't stop the container
+                    if container and returncode is None:
+                        await asyncio.shield(self.container.remove(container))
         except Exception as e:
             return TestResult(errors=1, output=str(e), outdir=outdir)
 
@@ -1501,6 +1626,8 @@ class LabgridAgent:
             "arch": data.get("arch"),
             # the labgrid place for hardware, <lab>-<platform> for QEMU
             "device": self._job_places.get(job.get("id"), f"{self.lab_name}-{platform}"),
+            # the tests repository commit the job ran
+            **(self._job_suites[job["id"]].info() if job.get("id") in self._job_suites else {}),
         }
 
     @staticmethod
@@ -1648,6 +1775,18 @@ def main() -> None:
                         help="Seconds to wait for a free place before leaving a job (default: 60)")
     parser.add_argument("--max-jobs", type=int,
                         help="At most this many jobs at once (default: one per platform, no limit)")
+    parser.add_argument("--tests-repo", help="git URL of the test suite (tests/, targets/, "
+                                             "strategies/), kept up to date instead of --tests-dir")
+    parser.add_argument("--tests-ref", help="Branch, tag or commit of --tests-repo (default: HEAD)")
+    parser.add_argument("--tests-update-interval", type=int,
+                        help="Seconds between fetches of --tests-repo "
+                             "(default: 300; 0: at start only)")
+    parser.add_argument("--container-image", help="Run pytest in this podman image")
+    parser.add_argument("--container-command", help="Container engine (default: podman)")
+    parser.add_argument("--container-network", help="Network of the test container (default: host)")
+    parser.add_argument("--container-arg", dest="container_args", action="append",
+                        help="Extra `podman run` option, repeatable "
+                             "(e.g. --container-arg=--userns=keep-id)")
     parser.add_argument("--debug", "-d", action="store_true", help="Debug logging")
 
     args = parser.parse_args()
@@ -1669,10 +1808,12 @@ def main() -> None:
         return
 
     for key, hint in (("lab_name", "--lab-name / lab_name"),
-                      ("api_token", "--api-token / [api] token"),
-                      ("tests_dir", "--tests-dir / tests_dir")):
+                      ("api_token", "--api-token / [api] token")):
         if not settings[key]:
             parser.error(f"{key} required ({hint})")
+    if not settings["tests_dir"] and not settings["tests_repo"]:
+        parser.error("tests_dir or tests_repo required (--tests-dir / tests_dir, "
+                     "--tests-repo / [tests] repo)")
 
     if not settings["coordinator"] and not settings["platforms"]:
         parser.error("no coordinator and no platforms: set `coordinator` (real hardware) "
@@ -1684,12 +1825,15 @@ def main() -> None:
     )
     if config_path:
         logger.info(f"Config file: {config_path}")
+    if settings["tests_repo"] and any(settings[k] for k in
+                                      ("tests_dir", "targets_dir", "strategies_dir")):
+        logger.warning("tests_repo is set: ignoring tests_dir, targets_dir and strategies_dir")
 
     agent = LabgridAgent(
         api_url=settings["api_url"],
         api_token=settings["api_token"],
         lab_name=settings["lab_name"],
-        tests_dir=Path(settings["tests_dir"]).resolve(),
+        tests_dir=Path(settings["tests_dir"] or ".").resolve(),
         targets_dir=settings["targets_dir"],
         strategies_dir=settings["strategies_dir"],
         storage_url=settings["storage_url"],
@@ -1706,6 +1850,13 @@ def main() -> None:
         reserve_timeout=int(settings["reserve_timeout"]),
         max_jobs=int(settings["max_jobs"]) if settings["max_jobs"] else None,
         pool=settings["pool"],
+        tests_repo=settings["tests_repo"],
+        tests_ref=settings["tests_ref"],
+        tests_update_interval=int(settings["tests_update_interval"]),
+        container_image=settings["container_image"],
+        container_command=settings["container_command"],
+        container_network=settings["container_network"],
+        container_args=settings["container_args"],
     )
 
     # Signal handling
