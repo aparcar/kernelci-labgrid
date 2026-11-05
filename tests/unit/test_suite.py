@@ -1,7 +1,9 @@
 """Test suite from a git repository, and pytest in a container."""
 
 import asyncio
+import getpass
 import os
+import socket
 import subprocess
 from pathlib import Path
 
@@ -165,6 +167,9 @@ async def test_pytest_runs_in_container(tmp_path, container_agent):
     # The whole snapshot: pytest's settings are in the repository's pyproject.toml
     assert f"{suite.root.resolve()}:{suite.root.resolve()}:ro" in args
     assert "LG_PLACE=p1" in args and f"LG_IMAGE={fw}" in args
+    # The place's lock owner, as the agent locked it
+    assert f"LG_HOSTNAME={socket.gethostname()}" in args
+    assert f"LG_USERNAME={getpass.getuser()}" in args
     i = args.index("--entrypoint")
     assert args[i + 1:i + 5] == ["python3", "localhost/runner", "-m", "pytest"]
     assert "test_a.py" in args

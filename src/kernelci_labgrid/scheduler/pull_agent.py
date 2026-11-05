@@ -33,6 +33,7 @@ Job protocol (see openwrtci/plan.md):
 from __future__ import annotations
 
 import asyncio
+import getpass
 import random
 import re
 import hashlib
@@ -1390,7 +1391,13 @@ class LabgridAgent:
                 mounts=[*((p, False) for p in suite.mounts()), (firmware, False), (outdir, True)],
                 env={"LG_IMAGE": str(firmware), "PYTHONUNBUFFERED": "1",
                      # the suite is read-only
-                     "PYTHONDONTWRITEBYTECODE": "1", **(extra_env or {})})
+                     "PYTHONDONTWRITEBYTECODE": "1",
+                     # labgrid in the container must count as the agent,
+                     # which locked the place (hostname/user, not the
+                     # container's)
+                     "LG_HOSTNAME": os.environ.get("LG_HOSTNAME", socket.gethostname()),
+                     "LG_USERNAME": os.environ.get("LG_USERNAME", getpass.getuser()),
+                     **(extra_env or {})})
             env = child_env()
         else:
             env = child_env()
