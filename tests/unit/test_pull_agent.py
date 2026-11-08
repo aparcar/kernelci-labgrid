@@ -177,6 +177,29 @@ class TestParseJunitXml:
         assert result.skipped == 1
         assert result.failed == 0
 
+    def test_parse_xfail(self, agent, tmp_path):
+        """pytest's junitxml writes an xfail as a skip of type pytest.xfail."""
+        junit_xml = tmp_path / "results.xml"
+        junit_xml.write_text("""<?xml version="1.0" encoding="utf-8"?>
+<testsuite name="pytest" tests="2" errors="0" failures="0" skipped="2" time="2.0">
+    <testcase classname="tests.test_tls" name="test_revoked" time="1.0">
+        <skipped type="pytest.xfail" message="uclient-fetch checks no revocation" />
+    </testcase>
+    <testcase classname="tests.test_wifi" name="test_ap" time="1.0">
+        <skipped type="pytest.skip" message="no wifi">tests/test_wifi.py:10: no wifi</skipped>
+    </testcase>
+</testsuite>
+""")
+
+        result = agent._parse_junit_xml(junit_xml)
+        revoked, ap = result.test_cases
+
+        assert revoked["result"] == "xfail"
+        assert revoked["message"] == "uclient-fetch checks no revocation"
+        assert ap["result"] == "skip"
+        assert result.skipped == 2
+        assert result.xfailed == 1
+
     def test_parse_with_errors(self, agent, tmp_path):
         junit_xml = tmp_path / "results.xml"
         junit_xml.write_text("""<?xml version="1.0" encoding="utf-8"?>

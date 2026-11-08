@@ -108,6 +108,11 @@ class TestResult:
     outdir: Path | None = None
 
     @property
+    def xfailed(self) -> int:
+        """Expected failures (pytest xfail), counted in `skipped` as well."""
+        return sum(1 for tc in self.test_cases if tc["result"] == "xfail")
+
+    @property
     def success(self) -> bool:
         return self.failed == 0 and self.errors == 0
 
@@ -1354,9 +1359,11 @@ class LabgridAgent:
                         error = testcase.find("error")
                         message = error.get("message", "") if error is not None else ""
                     elif testcase.find("skipped") is not None:
-                        tc_result = "skip"
                         skipped = testcase.find("skipped")
-                        message = skipped.get("message", "") if skipped is not None else ""
+                        # pytest's junitxml: an xfail is <skipped type="pytest.xfail"
+                        # message="<reason>"> (the marker's reason or pytest.xfail()'s)
+                        tc_result = "xfail" if skipped.get("type") == "pytest.xfail" else "skip"
+                        message = skipped.get("message", "")
                     else:
                         tc_result = "pass"
                         message = ""
@@ -1445,6 +1452,10 @@ class LabgridAgent:
                     data["error_msg"] = tc["message"][:1000]
                 if tc.get("properties"):
                     data["misc"]["properties"] = tc["properties"]
+                if tc["result"] == "xfail":
+                    # result stays "skip" (Maestro and KCIDB have no xfail);
+                    # the reason (known issue) is in error_msg
+                    data["misc"]["outcome"] = "xfail"
                 leaves.append({"node": {
                     "name": tc["name"],
                     "kind": "test",
@@ -1481,6 +1492,8 @@ class LabgridAgent:
                                      "failed": result.failed,
                                      "errors": result.errors,
                                      "skipped": result.skipped,
+                                     # of the skipped: expected failures (xfail)
+                                     "xfailed": result.xfailed,
                                      "boot": result.boot_result,
                                  }}}
         if result.returncode == PYTEST_RC_NO_SHELL:
@@ -1585,6 +1598,7 @@ class LabgridAgent:
             "passed": "pass",
             "failed": "fail",
             "skipped": "skip",
+            "xfail": "skip",
             "xfailed": "skip",
             "xpassed": "pass",
         }

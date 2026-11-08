@@ -114,7 +114,8 @@ class TestBuildHierarchy:
         assert node["data"]["device"] == "openwrt-local-qemu_armsr-armv8"
         assert node["data"]["misc"]["openwrt"] == {"name": "QEMU arm64"}  # scheduler's, kept
         assert node["data"]["misc"]["summary"] == {
-            "total": 4, "passed": 2, "failed": 1, "errors": 0, "skipped": 1, "boot": "pass"}
+            "total": 4, "passed": 2, "failed": 1, "errors": 0, "skipped": 1, "xfailed": 0,
+            "boot": "pass"}
 
         modules = {c["node"]["name"]: c for c in h["child_nodes"]}
         assert set(modules) == {"base", "lan", "wifi"}
@@ -152,6 +153,21 @@ class TestBuildHierarchy:
         memory, shell = (c["node"] for c in h["child_nodes"][0]["child_nodes"])
         assert memory["data"]["misc"]["properties"] == {"used_memory": "38"}
         assert "properties" not in shell["data"]["misc"]
+
+    def test_xfail(self, agent):
+        known = case("tls", "test_revoked", "xfail", message="uclient-fetch checks no revocation")
+        result = TestResult(passed=1, skipped=1, total=2, returncode=0,
+                            test_cases=[known, case("tls", "test_valid", "pass")])
+        h = agent._build_hierarchy(JOB, result, {})
+
+        revoked, valid = (c["node"] for c in h["child_nodes"][0]["child_nodes"])
+        assert revoked["result"] == "skip"  # Maestro and KCIDB have no xfail
+        assert revoked["data"]["misc"]["outcome"] == "xfail"
+        assert revoked["data"]["error_msg"] == "uclient-fetch checks no revocation"
+        assert "outcome" not in valid["data"]["misc"]
+        assert h["child_nodes"][0]["node"]["result"] == "pass"
+        assert h["node"]["result"] == "pass"
+        assert h["node"]["data"]["misc"]["summary"]["xfailed"] == 1
 
     def test_infra_error_code(self, agent):
         h = agent._build_hierarchy(JOB, TestResult(returncode=2), {})
