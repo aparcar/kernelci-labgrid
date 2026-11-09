@@ -74,8 +74,14 @@ from kernelci_labgrid.labgrid import (
     kill_group,
     spawn,
 )
+from kernelci_labgrid.live import LiveSession
 
 logger = logging.getLogger(__name__)
+
+# pytest plugin that reports test starts and results while pytest runs (for
+# the live view); copied next to each run, see progress_plugin.py
+PROGRESS_PLUGIN = Path(__file__).resolve().parent.parent / "progress_plugin.py"
+PROGRESS_MODULE = "kci_progress"
 
 # openwrt-tests' conftest exits pytest with 3 when the firmware never reaches
 # a shell; 0/1/5 are "ran normally" (all passed, some failed, none collected).
@@ -1043,6 +1049,9 @@ class LabgridAgent:
             data["runtime"] = self.lab_name
         data["job_id"] = claim_id
         misc["worker"] = self.worker_id
+        if self._live_enabled:
+            # where the live view of the run will be (written once it starts)
+            misc["live"] = self._live_index_url(node_id)
         try:
             await self._api_put(f"/node/{node_id}", self._writable(current))
         except Exception as e:
@@ -1074,6 +1083,14 @@ class LabgridAgent:
 
         logger.info(f"Executing: {job_name} ({node_id}) on {platform}")
 
+        # The live view (logs and progress while it runs), when the claim
+        # announced it (data.misc.live) and storage is configured
+        live = None
+        if self._live_enabled and ((job.get("data") or {}).get("misc") or {}).get("live"):
+            live = self._new_live(node_id, outdir)
+            live.set_phase("fetching")
+            live.start()
+
         try:
             target_yaml = self._find_target_yaml(platform)
             if not target_yaml:
@@ -1092,6 +1109,8 @@ class LabgridAgent:
                 self.artifact_dir / "firmware",
             )
 
+            if live:
+                live.set_phase("starting")
             result = await self._run_pytest(
                 target_yaml=target_yaml,
                 firmware=firmware,
@@ -1099,8 +1118,11 @@ class LabgridAgent:
                 timeout=test.get("timeout_s", self.default_timeout),
                 outdir=outdir,
                 extra_env=extra_env,
+                live=live,
             )
 
+            if live:
+                await live.finish("reporting")
             await self._report_results(job, result)
 
             logger.info(f"Completed {job_name}: {self._job_result(result)} "
@@ -1109,11 +1131,15 @@ class LabgridAgent:
 
         except asyncio.CancelledError:
             logger.info(f"Cancelled {job_name} ({node_id}), returning it to the queue")
+            if live:
+                await live.finish("cancelled")
             await self._unclaim(job)
             raise
 
         except Exception as e:
             logger.exception(f"Job failed: {job_name}")
+            if live:
+                await live.finish("failed")
             await self._report_failure(job, str(e), outdir)
 
         finally:
@@ -1240,9 +1266,15 @@ class LabgridAgent:
 
     async def _upload_file(self, path: Path, dest: str) -> str | None:
         """Upload one file to kernelci-storage under dest; its URL or None."""
+        return await self._upload_bytes(dest, path.name, path.read_bytes())
+
+    async def _upload_bytes(self, dest: str, name: str, content: bytes) -> str | None:
+        """Upload content as dest/name to kernelci-storage; its URL or None."""
+        if not self._session:
+            return None
         form = aiohttp.FormData()
         form.add_field("path", dest)
-        form.add_field("file0", path.read_bytes(), filename=path.name)
+        form.add_field("file0", content, filename=name)
         try:
             async with self._session.post(
                 f"{self.storage_url}/v1/file",
@@ -1251,10 +1283,38 @@ class LabgridAgent:
             ) as resp:
                 if resp.status not in (200, 201):
                     raise RuntimeError(f"HTTP {resp.status} {await resp.text()}")
-            return f"{self.storage_url}/{dest}/{path.name}"
+            return f"{self.storage_url}/{dest}/{name}"
         except Exception as e:
-            logger.error(f"Failed to upload {path.name}: {e}")
+            logger.error(f"Failed to upload {name}: {e}")
             return None
+
+    # ==================== Live View ====================
+
+    @property
+    def _live_enabled(self) -> bool:
+        return bool(self.storage_url and self.storage_token)
+
+    def _live_dest(self, node_id: str) -> str:
+        return f"logs/{self.lab_name}/{node_id}/live"
+
+    def _live_index_url(self, node_id: str) -> str:
+        return f"{self.storage_url}/{self._live_dest(node_id)}/index.json"
+
+    def _new_live(self, node_id: str, outdir: Path) -> LiveSession:
+        """The live view of a job: the console log (labgrid's console_*, which
+        appears once pytest talks to the device), pytest's output and the
+        plugin's progress events, all in outdir (see _run_pytest)."""
+        live = LiveSession(self._upload_bytes, self._live_dest(node_id))
+        live.add_log("console", lambda: next(iter(sorted(outdir.glob("console_*"))), None))
+        live.add_log("pytest", lambda: outdir / "pytest.log")
+        live.follow_events(outdir / "progress.jsonl")
+        return live
+
+    @staticmethod
+    def _without_live(misc: dict[str, Any] | None) -> dict[str, Any]:
+        """data.misc without the live view pointer: once the job is done (or
+        back in the queue) its results and logs are on the nodes."""
+        return {k: v for k, v in (misc or {}).items() if k != "live"}
 
     # ==================== Test Execution ====================
 
@@ -1319,11 +1379,16 @@ class LabgridAgent:
         timeout: int,
         outdir: Path,
         extra_env: dict[str, str] | None = None,
+        live: LiveSession | None = None,
     ) -> TestResult:
-        """Run pytest with the labgrid environment in the tests repo."""
+        """Run pytest with the labgrid environment in the tests repo.
+
+        With `live`, pytest also reports its progress (progress_plugin.py)
+        and writes its output unbuffered, so the live view can follow it."""
         outdir.mkdir(parents=True, exist_ok=True)
         junit_xml = outdir / "results.xml"
         pytest_log = outdir / "pytest.log"
+        progress = outdir / "progress.jsonl"
 
         cmd = [
             *self.pytest_command,
@@ -1346,6 +1411,22 @@ class LabgridAgent:
         env = child_env()
         env["LG_IMAGE"] = str(firmware)
         env.update(extra_env or {})
+
+        if live:
+            # A job run again by this lab reuses outdir, and labgrid appends
+            # to its console log: start empty, so the live and the uploaded
+            # logs are this run's only
+            for stale in [progress, *outdir.glob("console_*")]:
+                stale.unlink(missing_ok=True)
+            plugins = outdir / "plugins"
+            plugins.mkdir(exist_ok=True)
+            shutil.copyfile(PROGRESS_PLUGIN, plugins / f"{PROGRESS_MODULE}.py")
+            cmd += ["-p", PROGRESS_MODULE]
+            env["PYTHONPATH"] = os.pathsep.join(
+                p for p in (str(plugins), env.get("PYTHONPATH")) if p)
+            env["KCI_PROGRESS_FILE"] = str(progress)
+            env["KCI_CONSOLE_DIR"] = str(outdir)
+            env["PYTHONUNBUFFERED"] = "1"
 
         logger.info(f"Running: {shlex.join(cmd)}")
 
@@ -1549,7 +1630,7 @@ class LabgridAgent:
         node["data"] = {**job_data, **node_data,
                         # In misc (kept with what the scheduler put there):
                         # Maestro drops data fields its job model doesn't know
-                        "misc": {**(job_data.get("misc") or {}),
+                        "misc": {**self._without_live(job_data.get("misc")),
                                  "duration_ms": int(result.duration * 1000),
                                  # lets dashboards show counts without fetching the tests
                                  "summary": {
@@ -1627,7 +1708,7 @@ class LabgridAgent:
             if current.get("state") != "available" or data.get("job_id") != claim_id:
                 return
             data.pop("job_id", None)
-            misc = data["misc"] = dict(data.get("misc") or {})
+            misc = data["misc"] = self._without_live(data.get("misc"))
             misc.pop("worker", None)
             pool = misc.pop("pool", None)
             if pool:
@@ -1649,6 +1730,8 @@ class LabgridAgent:
             current["artifacts"] = {**(current.get("artifacts") or {}), **artifacts}
             current["data"] = {**(current.get("data") or {}), **self._node_data(job),
                                "error_code": "Infrastructure", "error_msg": error[:1000]}
+            if "misc" in current["data"]:
+                current["data"]["misc"] = self._without_live(current["data"]["misc"])
             await self._api_put(f"/node/{node_id}", self._writable(current))
         except Exception as e:
             logger.error(f"Failed to report failure: {e}")
