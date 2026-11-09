@@ -38,14 +38,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import random
-import re
 import hashlib
 import json
 import logging
+import os
+import random
+import re
 import shlex
 import shutil
-import os
 import signal
 import socket
 import sys
@@ -170,7 +170,7 @@ class DeviceHealth:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "DeviceHealth":
+    def from_dict(cls, data: dict[str, Any]) -> DeviceHealth:
         return cls(
             device=data["device"],
             state=data.get("state", "unknown"),
@@ -208,7 +208,7 @@ class HealthCheckConfig:
             "test_path", "timeout", "enabled")
 
     @classmethod
-    def from_dict(cls, device: str, data: dict[str, Any]) -> "HealthCheckConfig":
+    def from_dict(cls, device: str, data: dict[str, Any]) -> HealthCheckConfig:
         """From TOML keys: firmware + sha256 (explicit golden image), release,
         test_path, frequency_hours, timeout, target (default <device>.yaml),
         enabled."""
@@ -238,7 +238,7 @@ class HealthCheckConfig:
         return defaults, devices
 
     @classmethod
-    def from_toml(cls, path: Path) -> "HealthCheckConfig":
+    def from_toml(cls, path: Path) -> HealthCheckConfig:
         """One device per file: `device = "..."` plus the keys above
         (default device: the file name)."""
         with open(path, "rb") as f:
@@ -380,7 +380,7 @@ class LabgridAgent:
         self._device_health: dict[str, DeviceHealth] = {}
         self._fetch_locks: dict[Path, asyncio.Lock] = {}
 
-    async def __aenter__(self) -> "LabgridAgent":
+    async def __aenter__(self) -> LabgridAgent:
         await self.start()
         return self
 
