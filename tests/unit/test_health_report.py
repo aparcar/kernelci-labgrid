@@ -1,5 +1,6 @@
 """Health reports: healthcheck nodes tell the server which devices a lab has."""
 
+import asyncio
 from datetime import datetime, timedelta
 
 import pytest
@@ -227,7 +228,7 @@ def three_places(agent, posted, monkeypatch):
 async def test_each_place_is_checked_and_reported(three_places, posted):
     agent = three_places
     await agent._check_health()
-    assert [(n["data"]["device"], n["result"]) for n in posted] == [
+    assert sorted((n["data"]["device"], n["result"]) for n in posted) == [
         ("p1", "pass"), ("p2", "fail"), ("p3", "pass")]
     assert all(n["data"]["platform"] == "openwrt_one" for n in posted)
     assert ("reserve", "openwrt_one", "p2") in agent._labgrid.calls
@@ -235,6 +236,81 @@ async def test_each_place_is_checked_and_reported(three_places, posted):
     # nothing due: no new reports
     await agent._check_health()
     assert len(posted) == 3
+
+
+@pytest.fixture
+def concurrency(three_places, monkeypatch):
+    """Records how many health checks run at once."""
+    seen = {"now": 0, "max": 0}
+
+    async def pytest_run(**kwargs):
+        seen["now"] += 1
+        seen["max"] = max(seen["max"], seen["now"])
+        await asyncio.sleep(0.01)
+        seen["now"] -= 1
+        kwargs["outdir"].mkdir(parents=True, exist_ok=True)
+        return TestResult(passed=1, total=1, returncode=0)
+
+    monkeypatch.setattr(three_places, "_run_pytest", pytest_run)
+    return seen
+
+
+async def test_health_checks_run_in_parallel(three_places, concurrency, posted):
+    await three_places._check_health()
+    assert concurrency["max"] == 3
+    assert len(posted) == 3
+
+
+@pytest.mark.parametrize("max_jobs, busy, expected", [(2, 0, 2), (2, 1, 1), (1, 1, 1)])
+async def test_max_jobs_caps_health_checks(three_places, concurrency, posted,
+                                           max_jobs, busy, expected):
+    """Running jobs count against max_jobs, one check always runs."""
+    three_places.max_jobs = max_jobs
+    three_places._busy_platforms = {f"job{i}" for i in range(busy)}
+    await three_places._check_health()
+    assert concurrency["max"] == expected
+    assert len(posted) == 3
+
+
+async def test_one_failing_device_does_not_stop_the_others(three_places, posted, monkeypatch):
+    real = three_places._check_device
+
+    async def check_device(platform, place):
+        if place == "p1":
+            raise RuntimeError("boom")
+        await real(platform, place)
+
+    monkeypatch.setattr(three_places, "_check_device", check_device)
+    await three_places._check_health()
+    assert sorted(n["data"]["device"] for n in posted) == ["p2", "p3"]
+
+
+async def test_parallel_fetches_download_once(agent, monkeypatch):
+    """Places of one board share the golden image: one download."""
+    downloads = []
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            downloads.append(1)
+            await asyncio.sleep(0.01)
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        @property
+        def content(self):
+            async def iter_chunked(size):
+                yield b"firmware"
+            return type("C", (), {"iter_chunked": staticmethod(iter_chunked)})()
+
+    agent._session = type("S", (), {"get": lambda self, url: Response()})()
+    paths = await asyncio.gather(*(agent._fetch_firmware("http://x/fw.bin", None, agent.artifact_dir)
+                                   for _ in range(3)))
+    assert len(downloads) == 1
+    assert {p.read_bytes() for p in paths} == {b"firmware"}
 
 
 async def test_jobs_go_to_healthy_places_only(three_places):

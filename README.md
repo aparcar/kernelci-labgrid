@@ -142,7 +142,7 @@ labgrid-agent \
 | `--coordinator` | The lab's labgrid-coordinator `host:port` (default: `127.0.0.1:20408`, or `LG_COORDINATOR`); `""` for a QEMU-only lab |
 | `--labgrid-command` | labgrid-client command for power off (default: the agent environment's `labgrid-client`) |
 | `--reserve-timeout` | Seconds to wait for a free place before leaving a job (default: 60) |
-| `--max-jobs` | At most this many jobs at once, e.g. for QEMU on a small machine (default: one per platform, no limit; or `LAB_MAX_JOBS`) |
+| `--max-jobs` | At most this many jobs at once, e.g. for QEMU on a small machine (default: one per platform, no limit; or `LAB_MAX_JOBS`). Also caps parallel health checks, counting running jobs (at least one check at a time) |
 | `--poll-interval`, `-p` | Seconds between polls (default: 30) |
 | `--once` | Poll once, wait for started jobs, exit |
 | `--artifact-dir`, `-a` | Where to download firmware and keep job outputs |
@@ -153,8 +153,9 @@ labgrid-agent \
 
 ## How It Works
 
-1. **Checks health** - runs scheduled health checks if due and reports each
-   device's health to the API (see [Health Reports](#health-reports))
+1. **Checks health** - runs scheduled health checks if due, all devices in
+   parallel (at most `max_jobs` at once, if set), and reports each device's
+   health to the API (see [Health Reports](#health-reports))
 2. **Polls** `GET /nodes?kind=job&state=available&data.runtime=<lab>&data.platform=<p>`
    for each healthy platform, one job per platform at a time; with `pool` set,
    then also `data.runtime=<pool>`. A pool lets several labs offering the same

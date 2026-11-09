@@ -37,6 +37,7 @@ Job protocol (see openwrtci/plan.md):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import random
 import re
 import hashlib
@@ -328,7 +329,9 @@ class LabgridAgent:
             pool: Shared runtime that several labs take jobs from (jobs for
                 any lab offering the platform); claiming moves a job to this lab
             max_jobs: At most this many jobs at once (e.g. QEMU on a small
-                machine); default: one per platform, no overall limit
+                machine); default: one per platform, no overall limit. Also
+                caps parallel health checks (running jobs count, at least one
+                check at a time); default: all devices at once
         """
         self.api_url = api_url.rstrip("/")
         self.api_token = api_token
@@ -375,6 +378,7 @@ class LabgridAgent:
         self._health_configs: dict[str, HealthCheckConfig] = {}
         self._health_defaults: dict[str, Any] = {}
         self._device_health: dict[str, DeviceHealth] = {}
+        self._fetch_locks: dict[Path, asyncio.Lock] = {}
 
     async def __aenter__(self) -> "LabgridAgent":
         await self.start()
@@ -591,10 +595,23 @@ class LabgridAgent:
         devices = [(platform, place.name if place else None)
                    for platform in platforms
                    for place in (self._places_of(platform) or [None])]
-        for platform, place in devices:
-            if self._stopping:
-                return
-            await self._check_device(platform, place)
+        # Devices are checked in parallel; max_jobs also caps health checks,
+        # counting the jobs already running (at least one check at a time)
+        limit = (asyncio.Semaphore(max(1, self.max_jobs - len(self._busy_platforms)))
+                 if self.max_jobs else None)
+
+        async def check(platform: str, place: str | None) -> None:
+            async with limit or contextlib.nullcontext():
+                if self._stopping:
+                    return
+                try:
+                    await self._check_device(platform, place)
+                except Exception:
+                    logger.exception(f"Health check of {place or platform} failed")
+
+        await asyncio.gather(*(check(platform, place) for platform, place in devices))
+        if self._stopping:
+            return
         # Forget devices that are gone (removed places; per-platform state of
         # hardware from agents before per-place health)
         if devices:
@@ -1127,7 +1144,13 @@ class LabgridAgent:
         dest_dir.mkdir(parents=True, exist_ok=True)
         self._make_traversable(dest_dir)
         path = dest_dir / url.rsplit("/", 1)[-1]
+        # Parallel health checks of a board's places share the golden image:
+        # one downloads and unpacks it, the others wait and reuse it
+        async with self._fetch_locks.setdefault(path, asyncio.Lock()):
+            return await self._fetch_firmware_locked(url, sha256, path)
 
+    async def _fetch_firmware_locked(self, url: str, sha256: str | None, path: Path) -> Path:
+        """_fetch_firmware for one file, holding its lock."""
         if not path.exists():
             logger.info(f"Downloading {url}")
             tmp = path.with_suffix(path.suffix + ".part")
@@ -1704,7 +1727,8 @@ def main() -> None:
     parser.add_argument("--reserve-timeout", type=int,
                         help="Seconds to wait for a free place before leaving a job (default: 60)")
     parser.add_argument("--max-jobs", type=int,
-                        help="At most this many jobs at once (default: one per platform, no limit)")
+                        help="At most this many jobs and health checks at once "
+                             "(default: one per platform, no limit)")
     parser.add_argument("--debug", "-d", action="store_true", help="Debug logging")
 
     args = parser.parse_args()
