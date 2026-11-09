@@ -29,9 +29,9 @@ class FakeLabgrid:
     async def places(self):
         return self._places
 
-    async def reserve(self, platform, timeout):
-        self.calls.append(("reserve", platform))
-        return Lease(reservation_id="RES1", place=self.place)
+    async def reserve(self, platform, timeout, place=None):
+        self.calls.append(("reserve", platform, place) if place else ("reserve", platform))
+        return Lease(reservation_id="RES1", place=place or self.place)
 
     async def release(self, lease, power_off=True):
         self.calls.append(("release", lease.reservation_id))

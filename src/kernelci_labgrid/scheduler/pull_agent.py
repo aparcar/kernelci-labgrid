@@ -23,11 +23,15 @@ Job protocol (see openwrtci/plan.md):
                 module + one leaf per test, and a sibling "boot" test node
                 under the build (the dashboard only counts "boot*" as boots)
   health        POST /node: a top-level kind=job, name=healthcheck node per
-                device, state=done, data.platform, data.runtime=<lab>,
-                data.device=<place>, result pass (check passed), fail (check
-                failed, or maintenance) or skip (no check possible), the why
-                in data.error_msg; after every check, else on changes and
-                every HEARTBEAT_HOURS
+                device (each labgrid place of a hardware platform, so several
+                copies of a board are checked and reported one by one; QEMU
+                platforms once), state=done, data.platform,
+                data.runtime=<lab>, data.device=<place> (<lab>-<platform> for
+                QEMU), result pass (check passed), fail (check failed, or
+                maintenance) or skip (no check possible), the why in
+                data.error_msg; after every check, else on changes and every
+                HEARTBEAT_HOURS. A platform takes jobs while one of its places
+                is healthy, and jobs only go to healthy places.
 """
 
 from __future__ import annotations
@@ -139,7 +143,8 @@ class TestResult:
 
 @dataclass
 class DeviceHealth:
-    """Health state of a device."""
+    """Health state of a device: a labgrid place (named after it), or a QEMU
+    platform (named after the platform)."""
 
     device: str
     state: str = "unknown"  # good, bad, unknown
@@ -572,49 +577,83 @@ class LabgridAgent:
         except Exception as e:
             logger.error(f"Failed to save health state: {e}")
 
+    def _places_of(self, platform: str) -> list[Place]:
+        """The labgrid places of a platform (none for QEMU)."""
+        return [p for p in self._places if p.device == platform]
+
     async def _check_health(self) -> None:
         """Run due health checks and report every device's health: devices
-        without a check due (or without health checks) get a heartbeat."""
-        now = datetime.now()
-
+        without a check due (or without health checks) get a heartbeat. A
+        hardware platform's places are devices of their own."""
         # The lab's platforms (discovered or configured), plus devices with
         # their own config when the lab has no platform list yet
-        devices = self.platforms or list(self._health_configs)
-        for device in devices:
+        platforms = self.platforms or list(self._health_configs)
+        devices = [(platform, place.name if place else None)
+                   for platform in platforms
+                   for place in (self._places_of(platform) or [None])]
+        for platform, place in devices:
             if self._stopping:
                 return
-            reason = self._maintenance(device)
-            if reason is not None:
-                await self._report_health(device, "fail", f"maintenance: {reason}", heartbeat=True)
-                continue
+            await self._check_device(platform, place)
+        # Forget devices that are gone (removed places; per-platform state of
+        # hardware from agents before per-place health)
+        if devices:
+            current = {place or platform for platform, place in devices}
+            for name in set(self._device_health) - current:
+                del self._device_health[name]
+            self._save_health_state()
 
-            config = self._health_config(device)
-            health = self._device_health.get(device)
-            if config and not (health and health.last_check and now < health.last_check
-                               + timedelta(hours=config.frequency_hours)):
-                logger.info(f"Running health check for {device}")
-                if await self._run_health_check(device, config):
-                    continue  # reported
+    async def _check_device(self, platform: str, place: str | None) -> None:
+        """Check one device (a place of a hardware platform, or a QEMU
+        platform) if due, else send its heartbeat."""
+        reason = self._place_maintenance(place)
+        if reason is not None:
+            await self._report_health(platform, "fail", f"maintenance: {reason}",
+                                      place=place, heartbeat=True)
+            return
 
-            if not config:
-                result, reason = "skip", "no health check"
-            elif health and health.last_check:
-                result, reason = ("pass", "") if health.state == "good" else ("fail", health.failure_reason)
-            else:
-                result, reason = "skip", "not checked yet"
-            await self._report_health(device, result, reason, heartbeat=True)
+        config = self._health_config(platform)
+        health = self._device_health.get(place or platform)
+        if config and not (health and health.last_check and datetime.now() < health.last_check
+                           + timedelta(hours=config.frequency_hours)):
+            logger.info(f"Running health check for {place or platform}")
+            if await self._run_health_check(platform, config, place):
+                return  # reported
 
-    def _maintenance(self, device: str) -> str | None:
-        """The maintenance reason if all of the device's places have a
+        if not config:
+            result, reason = "skip", "no health check"
+        elif health and health.last_check:
+            result, reason = ("pass", "") if health.state == "good" else ("fail", health.failure_reason)
+        else:
+            result, reason = "skip", "not checked yet"
+        await self._report_health(platform, result, reason, place=place, heartbeat=True)
+
+    def _place_maintenance(self, place: str | None) -> str | None:
+        """The reason of a place's maintenance tag ("maintenance" if empty),
+        else None."""
+        for p in self._places:
+            if p.name == place and p.maintenance is not None:
+                return p.maintenance or "maintenance"
+        return None
+
+    def _maintenance(self, platform: str) -> str | None:
+        """The maintenance reason if all of the platform's places have a
         maintenance tag, else None. QEMU platforms have no places."""
-        places = [p for p in self._places if p.device == device]
+        places = self._places_of(platform)
         if places and all(p.maintenance is not None for p in places):
             return "; ".join(sorted({p.maintenance for p in places if p.maintenance})) or "maintenance"
         return None
 
-    async def _run_health_check(self, device: str, config: HealthCheckConfig) -> bool:
-        """Run a health check for a device and report it; False if it was
-        postponed (no free place)."""
+    def _healthy(self, device: str) -> bool:
+        """A device (place or QEMU platform) not known to be bad."""
+        health = self._device_health.get(device)
+        return not health or health.state != "bad"
+
+    async def _run_health_check(self, platform: str, config: HealthCheckConfig,
+                                place: str | None = None) -> bool:
+        """Run a health check of a device (a place of the platform, or the
+        QEMU platform) and report it; False if it was postponed (place busy)."""
+        device = place or platform
         health = self._device_health.get(device, DeviceHealth(device=device))
         workdir = self.artifact_dir / f"health-{device}"
 
@@ -625,15 +664,16 @@ class LabgridAgent:
             firmware_url, sha256 = await self._golden_image(config)
         except Exception as e:
             logger.error(f"Health check for {device} skipped: no golden image: {e}")
-            await self._report_health(device, "skip", f"no golden image: {e}", heartbeat=True)
+            await self._report_health(platform, "skip", f"no golden image: {e}",
+                                      place=place, heartbeat=True)
             return True
 
-        # Hardware: needs a free place; if busy, retry at the next poll
+        # Hardware: needs this place free; if busy, retry at the next poll
         lease = None
-        if self._is_remote(device):
-            lease = await self._reserve(device)
+        if self._is_remote(platform):
+            lease = await self._reserve(platform, place)
             if not lease:
-                logger.info(f"Health check for {device} postponed: no free place")
+                logger.info(f"Health check for {device} postponed: place not free")
                 return False
 
         result: TestResult | None = None
@@ -700,9 +740,8 @@ class LabgridAgent:
         }
         if result:
             details.update(passed=result.passed, failed=result.failed, total=result.total)
-        await self._report_health(device, "pass" if health.state == "good" else "fail",
-                                  health.failure_reason,
-                                  place=lease.place if lease else None,
+        await self._report_health(platform, "pass" if health.state == "good" else "fail",
+                                  health.failure_reason, place=place,
                                   outdir=workdir if workdir.exists() else None, details=details)
         return True
 
@@ -714,14 +753,15 @@ class LabgridAgent:
             return m.group(1)
         return "SNAPSHOT" if "/snapshots/" in firmware_url else None
 
-    async def _report_health(self, device: str, result: str, reason: str = "", *,
-                             heartbeat: bool = False, place: str | None = None,
+    async def _report_health(self, platform: str, result: str, reason: str = "", *,
+                             place: str | None = None, heartbeat: bool = False,
                              outdir: Path | None = None,
                              details: dict[str, Any] | None = None) -> None:
-        """Report a device's health as a healthcheck node (see the module
-        docstring). heartbeat: only if result or reason changed or the last
-        report is HEARTBEAT_HOURS old. On API errors the next poll reports
-        again."""
+        """Report a device's health (a place of the platform, or the QEMU
+        platform) as a healthcheck node (see the module docstring).
+        heartbeat: only if result or reason changed or the last report is
+        HEARTBEAT_HOURS old. On API errors the next poll reports again."""
+        device = place or platform
         health = self._device_health.setdefault(device, DeviceHealth(device=device))
         now = datetime.now()
         reported = f"{result}:{reason}"
@@ -731,12 +771,10 @@ class LabgridAgent:
         if not self._session:
             return
 
-        if not place:
-            places = sorted(p.name for p in self._places if p.device == device)
-            place = ", ".join(places) or f"{self.lab_name}-{device}"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         artifacts = await self._upload_logs(f"healthcheck/{device}/{stamp}", outdir) if outdir else {}
-        data: dict[str, Any] = {"platform": device, "runtime": self.lab_name, "device": place}
+        data: dict[str, Any] = {"platform": platform, "runtime": self.lab_name,
+                                "device": place or f"{self.lab_name}-{platform}"}
         if reason:
             data["error_msg"] = reason[-1000:]
         if details:
@@ -774,18 +812,16 @@ class LabgridAgent:
         logger.info(f"Golden image for {config.device}: {url}")
         return url, sha256
 
-    def is_device_healthy(self, device: str) -> bool:
-        """Check if a device is healthy (good or unknown state, not in
-        maintenance)."""
-        if self._maintenance(device) is not None:
-            return False
-        health = self._device_health.get(device)
-        if not health:
-            return True  # Unknown devices are assumed healthy
-        return health.state != "bad"
+    def is_device_healthy(self, platform: str) -> bool:
+        """Can the platform take jobs: one of its places (QEMU: the platform
+        itself) is in good or unknown state and not in maintenance."""
+        places = self._places_of(platform)
+        if not places:
+            return self._healthy(platform)  # unknown devices are assumed healthy
+        return any(p.maintenance is None and self._healthy(p.name) for p in places)
 
     def get_device_health(self, device: str) -> DeviceHealth | None:
-        """Get health state for a device."""
+        """Health state of a device (place or QEMU platform)."""
         return self._device_health.get(device)
 
     # ==================== API Methods ====================
@@ -876,9 +912,8 @@ class LabgridAgent:
                 if (reason := self._maintenance(platform)) is not None:
                     logger.info(f"Skipping {platform}: maintenance ({reason})")
                 else:
-                    health = self._device_health[platform]
-                    logger.info(f"Skipping {platform}: health check failed "
-                                f"({health.last_check}), no jobs until one passes")
+                    logger.info(f"Skipping {platform}: health check failed, "
+                                "no jobs until one passes")
                 continue
 
             # Jobs pinned to this lab first, then jobs in the shared pool
@@ -930,21 +965,29 @@ class LabgridAgent:
                 if lease:
                     await self._labgrid.release(lease)
 
-    async def _reserve(self, platform: str) -> Lease | None:
-        """Reserve and lock a free place for a hardware platform, or None."""
+    async def _reserve(self, platform: str, place: str | None = None) -> Lease | None:
+        """Reserve and lock a place of a hardware platform, or None: the given
+        place (health checks), else a free healthy one (jobs)."""
         if not self._labgrid:
             logger.warning(f"{platform} needs a labgrid place, but no coordinator is configured")
             return None
-        if not any(p.free and p.maintenance is None for p in self._places if p.device == platform):
-            logger.info(f"No free place for {platform}")
+        free = [p for p in self._places_of(platform) if p.free and p.maintenance is None]
+        if place:
+            free = [p for p in free if p.name == place]
+        else:
+            free = [p for p in free if self._healthy(p.name)]
+        if not free:
+            logger.info(f"No free place for {platform}" + (f" ({place})" if place else ""))
             return None
+        # Reserve the place by name when several could match the device tag:
+        # reservations can't exclude tags (maintenance) or bad health
+        name = free[0].name if place or len(free) < len(self._places_of(platform)) else None
         try:
-            lease = await self._labgrid.reserve(platform, self.reserve_timeout)
+            lease = await self._labgrid.reserve(platform, self.reserve_timeout, place=name)
         except Exception as e:
             logger.error(f"Reserving a place for {platform} failed: {e}")
             return None
-        # Reservations can't exclude tags: the coordinator may hand out a
-        # place in maintenance when the device has several
+        # A place in maintenance handed out anyway (tag set in the meantime)
         if lease and any(p.name == lease.place and p.maintenance is not None for p in self._places):
             logger.info(f"Place {lease.place} for {platform} is in maintenance")
             await self._labgrid.release(lease, power_off=False)

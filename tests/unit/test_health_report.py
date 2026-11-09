@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from kernelci_labgrid.labgrid import Place
+from kernelci_labgrid.labgrid import Lease, Place
 from kernelci_labgrid.scheduler.pull_agent import (
     HEARTBEAT_HOURS,
     DeviceHealth,
@@ -170,14 +170,98 @@ async def test_maintenance_tag(agent, posted):
     assert agent._labgrid.calls == []
 
 
-async def test_maintenance_place_handed_out_is_released(agent):
-    fake = FakeLabgrid([], place="p2")
+async def test_maintenance_place_is_not_reserved(agent):
+    fake = FakeLabgrid([])
     agent._labgrid = fake
     agent._places = [Place("p1", {"device": "openwrt_one"}),
                      Place("p2", {"device": "openwrt_one", "maintenance": "flaky"})]
     assert agent.is_device_healthy("openwrt_one")  # p1 still serves it
-    assert await agent._reserve("openwrt_one") is None
+    lease = await agent._reserve("openwrt_one")
+    assert lease.place == "p1"
+    assert fake.calls == [("reserve", "openwrt_one", "p1")]
+
+
+async def test_maintenance_place_handed_out_is_released(agent):
+    """The tag was set after the agent listed the places."""
+    fake = FakeLabgrid([], place="p2")
+    agent._labgrid = fake
+    agent._places = [Place("p1", {"device": "openwrt_one"}), Place("p2", {"device": "openwrt_one"})]
+    agent._places[1].tags["maintenance"] = "flaky"  # seen only after reserving
+
+    async def reserve(platform, timeout, place=None):
+        fake.calls.append(("reserve", platform))
+        return Lease(reservation_id="RES1", place="p2")
+
+    fake.reserve = reserve
+    assert await agent._reserve("openwrt_one", "p1") is None
     assert fake.calls == [("reserve", "openwrt_one"), ("release", "RES1")]
+
+
+@pytest.fixture
+def three_places(agent, posted, monkeypatch):
+    """One platform with three places (copies of a board), a health check
+    that fails on p2."""
+    agent._labgrid = FakeLabgrid([])
+    agent._places = [Place(f"p{i}", {"device": "openwrt_one"}) for i in (1, 2, 3)]
+    agent.platforms = ["openwrt_one"]
+    agent.health_checks = {}
+
+    async def golden(config):
+        return RELEASE_URL, None
+
+    async def fetch(url, sha256, dest):
+        return dest / "fw.img.gz"
+
+    async def pytest_run(**kwargs):
+        kwargs["outdir"].mkdir(parents=True, exist_ok=True)
+        if kwargs["extra_env"]["LG_PLACE"] == "p2":
+            return TestResult(passed=0, failed=1, total=1, returncode=3, output="no shell")
+        return TestResult(passed=1, total=1, returncode=0)
+
+    monkeypatch.setattr(agent, "_golden_image", golden)
+    monkeypatch.setattr(agent, "_fetch_firmware", fetch)
+    monkeypatch.setattr(agent, "_run_pytest", pytest_run)
+    return agent
+
+
+async def test_each_place_is_checked_and_reported(three_places, posted):
+    agent = three_places
+    await agent._check_health()
+    assert [(n["data"]["device"], n["result"]) for n in posted] == [
+        ("p1", "pass"), ("p2", "fail"), ("p3", "pass")]
+    assert all(n["data"]["platform"] == "openwrt_one" for n in posted)
+    assert ("reserve", "openwrt_one", "p2") in agent._labgrid.calls
+    assert agent.get_device_health("p2").state == "bad"
+    # nothing due: no new reports
+    await agent._check_health()
+    assert len(posted) == 3
+
+
+async def test_jobs_go_to_healthy_places_only(three_places):
+    agent = three_places
+    await agent._check_health()
+    agent._labgrid.calls.clear()
+    agent._places[0].reservation = "OTHER"  # p1 busy
+    assert agent.is_device_healthy("openwrt_one")
+    lease = await agent._reserve("openwrt_one")
+    assert lease.place == "p3"  # not p2 (bad)
+    agent._places[2].reservation = "OTHER"
+    assert await agent._reserve("openwrt_one") is None
+
+
+async def test_platform_unhealthy_when_all_places_bad(agent):
+    agent._places = [Place(f"p{i}", {"device": "openwrt_one"}) for i in (1, 2)]
+    agent._device_health["p1"] = DeviceHealth("p1", state="bad")
+    assert agent.is_device_healthy("openwrt_one")
+    agent._device_health["p2"] = DeviceHealth("p2", state="bad")
+    assert not agent.is_device_healthy("openwrt_one")
+
+
+async def test_old_per_platform_health_is_forgotten(three_places):
+    agent = three_places
+    agent._device_health["openwrt_one"] = DeviceHealth("openwrt_one", state="bad")
+    await agent._check_health()
+    assert set(agent._device_health) == {"p1", "p2", "p3"}
 
 
 def test_release_of():

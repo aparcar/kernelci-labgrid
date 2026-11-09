@@ -157,15 +157,17 @@ class Coordinator:
 
     # --- reservations and locks --------------------------------------------
 
-    async def reserve(self, platform: str, timeout: float) -> Lease | None:
-        """Reserve and lock a place with tag device=<platform>.
+    async def reserve(self, platform: str, timeout: float, place: str | None = None) -> Lease | None:
+        """Reserve and lock a place with tag device=<platform> (and, if
+        given, that name: the coordinator matches place names as name=<place>).
 
         Returns None (and cancels the reservation) if no place is allocated
         within `timeout` seconds or the lock fails.
         """
         await self.connect()
+        tags = {"device": platform, **({"name": place} if place else {})}
         request = pb2.CreateReservationRequest(
-            filters={"main": pb2.Reservation.Filter(filter={"device": platform})}, prio=0.0)
+            filters={"main": pb2.Reservation.Filter(filter=tags)}, prio=0.0)
         response = await self.session.stub.CreateReservation(request)
         # upstream labgrid: Reservation.id (the protobuf field is still `token`)
         reservation_id = Reservation.from_pb2(response.reservation).id
