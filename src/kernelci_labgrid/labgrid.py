@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_COORDINATOR = "127.0.0.1:20408"
 # Coordinators drop reservations 60s after the last poll; refresh well before
 REFRESH_INTERVAL = 20
+# openwrt-tests (tests/probe_fixtures.py PROBE_HOLDER) sets this comment on a
+# probe place it locks for a DUT place; keep both in sync
+PROBE_HOLDER = "held for {}"
 
 
 @dataclass
@@ -233,6 +236,9 @@ class Coordinator:
             lease.refresher.cancel()
         if power_off:
             await self.power_off(lease)
+        # While the DUT place is still ours: no other run can hold a probe
+        # for it yet
+        await self.release_probes(lease.place)
         try:
             await self.connect()
             await self.session.stub.ReleasePlace(pb2.ReleasePlaceRequest(placename=lease.place))
@@ -241,6 +247,37 @@ class Coordinator:
             logger.warning(f"Unlocking place {lease.place} failed: {e}")
         await self.cancel(lease.reservation_id)
         logger.info(f"Released place {lease.place}")
+
+    async def release_probes(self, dut_place: str) -> None:
+        """Unlock the probe places pytest locked for `dut_place` and left
+        locked: killed on the job timeout (SIGKILL, no teardown) or its own
+        release failed. openwrt-tests marks them with the comment
+        PROBE_HOLDER. Only places this agent's user holds (pytest runs as
+        it): ReleasePlace with `fromuser` leaves anyone else's lock alone.
+        Never raises."""
+        comment = PROBE_HOLDER.format(dut_place)
+        try:
+            await self.connect()
+            await self.session.sync_with_coordinator()
+            me = f"{self.session.gethostname()}/{self.session.getuser()}"
+            held = [name for name, p in sorted(self.session.places.items())
+                    if p.comment == comment]
+            for name in held:
+                acquired = self.session.places[name].acquired
+                if acquired == me:
+                    await self.session.stub.ReleasePlace(
+                        pb2.ReleasePlaceRequest(placename=name, fromuser=me))
+                    logger.warning(f"Released probe place {name}, left locked for {dut_place}")
+                elif acquired:
+                    logger.warning(f"Probe place {name} is marked as held for {dut_place} "
+                                   f"but locked by {acquired}: not touching it")
+                    continue
+                await self.session.stub.SetPlaceComment(
+                    pb2.SetPlaceCommentRequest(placename=name, comment=""))
+            if held:
+                await self.session.sync_with_coordinator()
+        except Exception as e:
+            logger.warning(f"Releasing probes held for {dut_place} failed: {e}")
 
     async def power_off(self, lease: Lease, timeout: float = 60) -> None:
         """Power control needs the target's drivers: use labgrid-client."""
