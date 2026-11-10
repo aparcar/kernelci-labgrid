@@ -9,13 +9,14 @@ One JSON object per line goes to $KCI_PROGRESS_FILE, flushed at once:
 
   {"event": "collected", "tests": [nodeid, ...]}
   {"event": "start", "nodeid": ..., "console": <bytes>}
-  {"event": "result", "nodeid": ..., "outcome": ..., "duration": <s>}
+  {"event": "result", "nodeid": ..., "outcome": ..., "duration": <s>, "message": ...}
   {"event": "finish", "exitstatus": <int>}
 
 each with "t" (Unix time). "console" is the size of the labgrid console
 log (console_* in $KCI_CONSOLE_DIR, written by --lg-log) when the test
 started: where its part of the console begins. outcome is passed, failed
-(the test itself), error (setup or teardown), skipped or xfailed.
+(the test itself), error (setup or teardown), skipped or xfailed; message
+(not for passed) says why: the failure, or the skip or xfail reason.
 """
 
 import json
@@ -70,6 +71,21 @@ def pytest_runtest_logstart(nodeid, location):
     _write({"event": "start", "nodeid": nodeid, "console": _console_size()})
 
 
+def _message(report) -> str:
+    """Why a test failed, errored, was skipped or is expected to fail: what
+    the result nodes get as error_msg later (as far as a report tells)."""
+    if hasattr(report, "wasxfail"):
+        return str(report.wasxfail or "")
+    longrepr = report.longrepr
+    if report.skipped and isinstance(longrepr, tuple) and len(longrepr) == 3:
+        return str(longrepr[2]).removeprefix("Skipped: ")
+    crash = getattr(longrepr, "reprcrash", None)
+    if crash is not None and getattr(crash, "message", None):
+        return str(crash.message)
+    text = (getattr(report, "longreprtext", "") or "").strip()
+    return text.splitlines()[-1] if text else ""
+
+
 def pytest_runtest_logreport(report):
     state = _running.setdefault(report.nodeid, {"outcome": "passed", "duration": 0.0})
     state["duration"] += report.duration
@@ -78,14 +94,19 @@ def pytest_runtest_logreport(report):
         # leaves it failed
         if state["outcome"] not in ("failed", "error"):
             state["outcome"] = "failed" if report.when == "call" else "error"
+            state["message"] = _message(report)
     elif report.skipped and state["outcome"] == "passed":
         state["outcome"] = "xfailed" if hasattr(report, "wasxfail") else "skipped"
+        state["message"] = _message(report)
 
 
 def pytest_runtest_logfinish(nodeid, location):
     state = _running.pop(nodeid, {"outcome": "passed", "duration": 0.0})
-    _write({"event": "result", "nodeid": nodeid, "outcome": state["outcome"],
-            "duration": round(state["duration"], 3)})
+    event = {"event": "result", "nodeid": nodeid, "outcome": state["outcome"],
+             "duration": round(state["duration"], 3)}
+    if state.get("message"):
+        event["message"] = state["message"][:1000]
+    _write(event)
 
 
 def pytest_sessionfinish(session, exitstatus):

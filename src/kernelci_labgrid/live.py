@@ -141,6 +141,8 @@ class Progress:
             test = self._test(event["nodeid"])
             test["result"] = OUTCOMES.get(event.get("outcome"), "incomplete")
             test["ms"] = int(float(event.get("duration") or 0) * 1000)
+            if event.get("message"):
+                test["message"] = event["message"]
             if self.current == event["nodeid"]:
                 self.current = None
         elif kind == "finish":

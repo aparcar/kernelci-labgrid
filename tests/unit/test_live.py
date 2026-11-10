@@ -273,6 +273,13 @@ def test_plugin_reports_a_real_run(tmp_path):
                        "test_param[2g]": "pass", "test_param[5g]": "pass"}
     assert s["total"] == 7 and s["done"] == 7 and s["current"] is None
     assert all(t["module"] == "demo" and t["console"] == 5 for t in s["tests"])
+    # why, as the result nodes' error_msg will say
+    messages = {t["name"]: t.get("message") for t in s["tests"]}
+    assert messages["test_pass"] is None
+    assert messages["test_fail"].startswith("assert False")
+    assert messages["test_skip"] == "no"
+    assert messages["test_xfail"] == "known"
+    assert messages["test_error"] == "RuntimeError: setup"
     assert p.exitstatus == 1
 
 
