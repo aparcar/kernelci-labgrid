@@ -154,6 +154,40 @@ class TestBuildHierarchy:
         assert memory["data"]["misc"]["properties"] == {"used_memory": "38"}
         assert "properties" not in shell["data"]["misc"]
 
+    def test_description(self, agent):
+        """The docstring (property `description`) goes to misc.description,
+        not with the recorded values."""
+        documented = {**case("base", "test_free_memory", "pass"),
+                      "properties": {"description": "  Enough free memory.\n", "used_memory": "38"}}
+        only_doc = {**case("base", "test_shell", "pass"),
+                    "properties": {"description": "A shell on the console."}}
+        result = TestResult(passed=3, total=3, returncode=0,
+                            test_cases=[documented, only_doc, case("base", "test_ssh", "pass")])
+        h = agent._build_hierarchy(JOB, result, {})
+
+        memory, shell, ssh = (c["node"] for c in h["child_nodes"][0]["child_nodes"])
+        assert memory["data"]["misc"]["description"] == "Enough free memory."
+        assert memory["data"]["misc"]["properties"] == {"used_memory": "38"}
+        assert shell["data"]["misc"]["description"] == "A shell on the console."
+        assert "properties" not in shell["data"]["misc"]
+        assert "description" not in ssh["data"]["misc"]
+
+    def test_module_description(self, agent):
+        """The module's docstring (property `module_description`, on each of
+        its tests) goes to the module node, and not into a test's properties."""
+        described = [{**case("base", name, "pass"),
+                      "properties": {"module_description": "The basics.", "used_memory": "38"}}
+                     for name in ("test_shell", "test_ssh")]
+        result = TestResult(passed=3, total=3, returncode=0,
+                            test_cases=[*described, case("wifi", "test_wifi_ap", "pass")])
+        h = agent._build_hierarchy(JOB, result, {})
+
+        base, wifi = (c["node"] for c in h["child_nodes"])
+        assert base["data"]["misc"] == {"description": "The basics."}
+        assert "misc" not in wifi["data"]
+        for leaf in h["child_nodes"][0]["child_nodes"]:
+            assert leaf["node"]["data"]["misc"]["properties"] == {"used_memory": "38"}
+
     def test_xfail(self, agent):
         known = case("tls", "test_revoked", "xfail", message="uclient-fetch checks no revocation")
         result = TestResult(passed=1, skipped=1, total=2, returncode=0,

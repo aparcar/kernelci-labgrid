@@ -88,6 +88,10 @@ PROGRESS_MODULE = "kci_progress"
 PYTEST_RC_NO_SHELL = 3
 PYTEST_RC_RAN = (0, 1, 5)
 
+# A test's description (its docstring) stored with each result: at most this
+# many characters
+MAX_DESCRIPTION = 2000
+
 # Dropped when PUTting a node back. Only alias/extra fields: PUT /node does
 # not use exclude_unset, so omitting e.g. created/timeout/retry_counter would
 # reset them to their defaults. Ownership fields are ignored by the API.
@@ -1592,13 +1596,23 @@ class LabgridAgent:
         children = []
         for module, cases in modules.items():
             leaves = []
+            module_description = ""
             for tc in cases:
                 # misc: Maestro drops data fields its test model doesn't know
                 data: dict[str, Any] = {**node_data, "misc": {"duration_ms": int(tc["duration"] * 1000)}}
                 if tc.get("message"):
                     data["error_msg"] = tc["message"][:1000]
-                if tc.get("properties"):
-                    data["misc"]["properties"] = tc["properties"]
+                properties = dict(tc.get("properties") or {})
+                # the docstrings of the test and its module (openwrt-tests'
+                # conftest.py records them as the properties `description`
+                # and `module_description`): what they check and why
+                description = properties.pop("description", "").strip()
+                if description:
+                    data["misc"]["description"] = description[:MAX_DESCRIPTION]
+                module_description = module_description or properties.pop("module_description", "").strip()
+                properties.pop("module_description", None)
+                if properties:
+                    data["misc"]["properties"] = properties
                 if tc["result"] == "xfail":
                     # result stays "skip" (Maestro and KCIDB have no xfail);
                     # the reason (known issue) is in error_msg
@@ -1619,7 +1633,8 @@ class LabgridAgent:
                 "path": job_path + [module],
                 "state": "done",
                 "result": self._aggregate([leaf["node"]["result"] for leaf in leaves]),
-                "data": dict(node_data),
+                "data": {**node_data, "misc": {"description": module_description[:MAX_DESCRIPTION]}}
+                if module_description else dict(node_data),
             }, "child_nodes": leaves})
 
         node = self._writable(job)
