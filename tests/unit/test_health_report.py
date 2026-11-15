@@ -8,6 +8,7 @@ import pytest
 from kernelci_labgrid.labgrid import Lease, Place
 from kernelci_labgrid.scheduler.pull_agent import (
     HEARTBEAT_HOURS,
+    AgentLockedError,
     DeviceHealth,
     LabgridAgent,
     TestResult,
@@ -48,7 +49,7 @@ def posted(agent, monkeypatch):
 
 async def test_device_without_health_check_reports_unknown(agent, posted):
     agent.platforms = ["qemu_x86-64"]
-    await agent._check_health()
+    await agent._check_health(wait=True)
     [node] = posted
     assert node["kind"] == "job" and node["name"] == "healthcheck" and "parent" not in node
     assert node["state"] == "done" and node["result"] == "skip"
@@ -101,7 +102,7 @@ async def test_health_check_reports_result(agent, posted, monkeypatch):
     monkeypatch.setattr(agent, "_golden_image", golden)
     monkeypatch.setattr(agent, "_fetch_firmware", fetch)
     monkeypatch.setattr(agent, "_run_pytest", pytest_run)
-    await agent._check_health()
+    await agent._check_health(wait=True)
     [node] = posted
     assert node["result"] == "pass"
     assert "error_msg" not in node["data"]
@@ -109,7 +110,7 @@ async def test_health_check_reports_result(agent, posted, monkeypatch):
     assert check["release"] == "25.12.5"
     assert check["passed"] == 2
     # done: the next round only sends heartbeats, none due yet
-    await agent._check_health()
+    await agent._check_health(wait=True)
     assert len(posted) == 1
 
 
@@ -136,9 +137,9 @@ async def test_health_check_logs_only_the_last_run(agent, posted, monkeypatch):
     monkeypatch.setattr(agent, "_golden_image", golden)
     monkeypatch.setattr(agent, "_fetch_firmware", fetch)
     monkeypatch.setattr(agent, "_run_pytest", pytest_run)
-    await agent._check_health()
+    await agent._check_health(wait=True)
     agent._device_health["qemu_x86-64"].last_check -= timedelta(days=30)
-    await agent._check_health()
+    await agent._check_health(wait=True)
     assert seen == ["run 0\n", "run 1\n"]
 
 
@@ -149,7 +150,7 @@ async def test_no_golden_image_reports_unknown(agent, posted, monkeypatch):
         raise RuntimeError("openwrt_one is in no release")
 
     monkeypatch.setattr(agent, "_golden_image", golden)
-    await agent._check_health()
+    await agent._check_health(wait=True)
     [node] = posted
     assert node["result"] == "skip"
     assert "no release" in node["data"]["error_msg"]
@@ -161,7 +162,7 @@ async def test_maintenance_tag(agent, posted):
                            {"device": "openwrt_one", "maintenance": "new_psu"})]
     agent.platforms = ["openwrt_one"]
     agent.health_checks = {}  # would check, but maintenance wins
-    await agent._check_health()
+    await agent._check_health(wait=True)
     [node] = posted
     assert node["result"] == "fail"
     assert node["data"]["error_msg"] == "maintenance: new_psu"
@@ -227,14 +228,14 @@ def three_places(agent, posted, monkeypatch):
 
 async def test_each_place_is_checked_and_reported(three_places, posted):
     agent = three_places
-    await agent._check_health()
+    await agent._check_health(wait=True)
     assert sorted((n["data"]["device"], n["result"]) for n in posted) == [
         ("p1", "pass"), ("p2", "fail"), ("p3", "pass")]
     assert all(n["data"]["platform"] == "openwrt_one" for n in posted)
     assert ("reserve", "openwrt_one", "p2") in agent._labgrid.calls
-    assert agent.get_device_health("p2").state == "bad"
+    assert agent._device_health["p2"].state == "bad"
     # nothing due: no new reports
-    await agent._check_health()
+    await agent._check_health(wait=True)
     assert len(posted) == 3
 
 
@@ -256,7 +257,7 @@ def concurrency(three_places, monkeypatch):
 
 
 async def test_health_checks_run_in_parallel(three_places, concurrency, posted):
-    await three_places._check_health()
+    await three_places._check_health(wait=True)
     assert concurrency["max"] == 3
     assert len(posted) == 3
 
@@ -264,24 +265,120 @@ async def test_health_checks_run_in_parallel(three_places, concurrency, posted):
 @pytest.mark.parametrize("max_jobs, busy, expected", [(2, 0, 2), (2, 1, 1), (1, 1, 1)])
 async def test_max_jobs_caps_health_checks(three_places, concurrency, posted,
                                            max_jobs, busy, expected):
-    """Running jobs count against max_jobs, one check always runs."""
+    """Running jobs count against max_jobs, one check always runs; the
+    others start at later polls."""
     three_places.max_jobs = max_jobs
     three_places._busy_platforms = {f"job{i}" for i in range(busy)}
-    await three_places._check_health()
+    await three_places._check_health(wait=True)
+    assert concurrency["max"] == expected
+    assert len(posted) == expected
+    for _ in range(3):
+        await three_places._check_health(wait=True)
     assert concurrency["max"] == expected
     assert len(posted) == 3
+
+
+async def test_health_checks_run_in_the_background(three_places, posted, monkeypatch):
+    """The poll loop doesn't wait for a check: a later poll leaves a running
+    check alone and doesn't start it twice."""
+    release = asyncio.Event()
+    runs = []
+
+    async def pytest_run(**kwargs):
+        runs.append(kwargs["extra_env"]["LG_PLACE"])
+        await release.wait()
+        kwargs["outdir"].mkdir(parents=True, exist_ok=True)
+        return TestResult(passed=1, total=1, returncode=0)
+
+    monkeypatch.setattr(three_places, "_run_pytest", pytest_run)
+    await asyncio.wait_for(three_places._check_health(), timeout=1)
+    await asyncio.sleep(0.01)
+    assert sorted(three_places._health_tasks) == ["p1", "p2", "p3"]
+    await asyncio.wait_for(three_places._check_health(), timeout=1)
+    assert sorted(runs) == ["p1", "p2", "p3"]
+    assert posted == []
+    release.set()
+    await asyncio.wait(list(three_places._health_tasks.values()), timeout=1)
+    await asyncio.sleep(0)  # done callbacks
+    assert not three_places._health_tasks
+    assert len(posted) == 3
+
+
+async def test_busy_qemu_platform_is_checked_after_its_job(agent, posted, monkeypatch):
+    agent.health_checks = {}
+    agent._busy_platforms = {"qemu_x86-64"}
+    ran = []
+
+    async def run_check(platform, config, place=None):
+        ran.append(platform)
+        return True
+
+    monkeypatch.setattr(agent, "_run_health_check", run_check)
+    await agent._check_health(wait=True)
+    assert ran == [] and not agent._health_tasks
+    assert posted[0]["result"] == "skip"  # heartbeat: not checked yet
+    agent._busy_platforms.clear()
+    await agent._check_health(wait=True)
+    assert ran == ["qemu_x86-64"]
+
+
+def test_one_agent_per_health_state_file(tmp_path):
+    def make():
+        return LabgridAgent(
+            api_url="http://x/latest", api_token="t", lab_name="lab", tests_dir=tmp_path,
+            health_state_file=tmp_path / "health.json", coordinator="")
+
+    first, second = make(), make()
+    first._lock_health_state()
+    first._device_health["d"] = DeviceHealth("d", state="good")
+    first._save_health_state()
+    with pytest.raises(AgentLockedError, match="another agent"):
+        second._lock_health_state()
+    # the second never writes the first one's file, also not when stopping
+    second._save_health_state()
+    assert '"good"' in (tmp_path / "health.json").read_text()
+    first._unlock_health_state()
+    third = make()
+    third._lock_health_state()  # free again (also when the first dies)
+    third._unlock_health_state()
+
+
+def test_health_state_written_whole(tmp_path):
+    agent = LabgridAgent(api_url="http://x/latest", api_token="t", lab_name="lab",
+                         tests_dir=tmp_path, health_state_file=tmp_path / "health.json")
+    agent._device_health["d"] = DeviceHealth("d", state="bad", failure_reason="no shell")
+    agent._save_health_state()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["health.json"]  # no .tmp left
+    again = LabgridAgent(api_url="http://x/latest", api_token="t", lab_name="lab",
+                         tests_dir=tmp_path, health_state_file=tmp_path / "health.json")
+    again._load_health_state()
+    assert again._device_health["d"].failure_reason == "no shell"
+
+
+async def test_reset_file_forgets_health(agent, posted, tmp_path):
+    agent.health_state_file = tmp_path / "health.json"
+    agent.health_reset_file = tmp_path / "health.reset"
+    agent._device_health["qemu_x86-64"] = DeviceHealth(
+        "qemu_x86-64", state="bad", last_check=datetime.now(), reported="fail:x")
+    agent._take_health_reset()
+    assert "qemu_x86-64" in agent._device_health  # no file: nothing happens
+    agent.health_reset_file.touch()
+    agent._take_health_reset()
+    assert not agent.health_reset_file.exists()
+    assert agent._device_health == {}
+    assert agent.health_state_file.exists()
 
 
 async def test_one_failing_device_does_not_stop_the_others(three_places, posted, monkeypatch):
     real = three_places._check_device
 
-    async def check_device(platform, place):
+    async def check_device(platform, place, run=True):
         if place == "p1":
             raise RuntimeError("boom")
-        await real(platform, place)
+        await real(platform, place, run=run)
 
     monkeypatch.setattr(three_places, "_check_device", check_device)
-    await three_places._check_health()
+    await three_places._check_health(wait=True)
     assert sorted(n["data"]["device"] for n in posted) == ["p2", "p3"]
 
 
@@ -315,7 +412,7 @@ async def test_parallel_fetches_download_once(agent, monkeypatch):
 
 async def test_jobs_go_to_healthy_places_only(three_places):
     agent = three_places
-    await agent._check_health()
+    await agent._check_health(wait=True)
     agent._labgrid.calls.clear()
     agent._places[0].reservation = "OTHER"  # p1 busy
     assert agent.is_device_healthy("openwrt_one")
@@ -336,7 +433,7 @@ async def test_platform_unhealthy_when_all_places_bad(agent):
 async def test_old_per_platform_health_is_forgotten(three_places):
     agent = three_places
     agent._device_health["openwrt_one"] = DeviceHealth("openwrt_one", state="bad")
-    await agent._check_health()
+    await agent._check_health(wait=True)
     assert set(agent._device_health) == {"p1", "p2", "p3"}
 
 

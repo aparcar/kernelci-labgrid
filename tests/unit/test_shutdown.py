@@ -1,4 +1,5 @@
-"""Ctrl-C: stop at once, kill test processes, return jobs to the queue."""
+"""Ctrl-C: stop at once, kill test processes, return jobs to the queue.
+SIGHUP: drain, finishing the running jobs."""
 
 import asyncio
 import os
@@ -127,3 +128,62 @@ async def test_cancelled_job_is_requeued(agent, monkeypatch):
     await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=2)
     assert returned == ["j1"]
     assert not agent._current_jobs and not agent._busy_platforms
+
+
+@pytest.fixture
+def looping(agent, monkeypatch):
+    """The agent's loop without API or coordinator: counts its polls."""
+    polls = []
+
+    async def poll():
+        polls.append(1)
+
+    async def check(wait=False):
+        pass
+
+    monkeypatch.setattr(agent, "_poll_and_execute", poll)
+    monkeypatch.setattr(agent, "_check_health", check)
+    agent._running = True
+    agent.poll_interval = 0.01
+    return polls
+
+
+async def test_polls_go_on_while_a_job_runs(agent, looping):
+    job = asyncio.create_task(asyncio.sleep(30))
+    agent._job_tasks.add(job)
+    run = asyncio.create_task(agent.run())
+    await asyncio.sleep(0.1)
+    assert len(looping) > 2  # not waiting for the job
+    agent.request_stop()
+    await asyncio.wait_for(run, timeout=1)
+    assert job.cancelled()
+
+
+async def test_drain_finishes_running_jobs_then_exits(agent, looping):
+    done = asyncio.Event()
+    job = asyncio.create_task(done.wait())
+    agent._job_tasks.add(job)
+    job.add_done_callback(agent._job_tasks.discard)
+    run = asyncio.create_task(agent.run())
+    await asyncio.sleep(0.05)
+    agent.request_drain()
+    polls = len(looping)
+    await asyncio.sleep(0.1)
+    assert not run.done()  # waits for the job, polls no more
+    assert len(looping) == polls
+    done.set()
+    await asyncio.wait_for(run, timeout=1)
+    assert not job.cancelled()
+
+
+async def test_drain_claims_nothing(agent, monkeypatch):
+    agent._draining = True
+    calls = []
+
+    async def fake_get(endpoint, **params):
+        calls.append(endpoint)
+        return {"items": []}
+
+    monkeypatch.setattr(agent, "_api_get", fake_get)
+    await agent._poll_and_execute()
+    assert calls == []

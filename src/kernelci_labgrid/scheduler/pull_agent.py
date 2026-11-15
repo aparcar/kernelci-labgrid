@@ -32,12 +32,20 @@ Job protocol (see openwrtci/plan.md):
                 data.error_msg; after every check, else on changes and every
                 HEARTBEAT_HOURS. A platform takes jobs while one of its places
                 is healthy, and jobs only go to healthy places.
+
+Jobs and health checks run in the background: the poll loop never waits for
+them, so a long job doesn't hold up other platforms' jobs. Signals: SIGTERM
+(or Ctrl-C) stops at once, running jobs go back to the queue; SIGHUP drains,
+claiming nothing new and exiting once the running jobs and checks are done
+(the service manager starts the agent again, e.g. with new code or config).
+Creating <health state file>.reset (health.reset next to health.json) makes
+the agent forget all device health and check every device again.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import fcntl
 import hashlib
 import json
 import logging
@@ -53,16 +61,11 @@ import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from typing import Any
 
 import aiohttp
-
-if sys.version_info >= (3, 11):
-    import tomllib
-else:  # pragma: no cover
-    import tomli as tomllib
 
 from kernelci_labgrid.firmware import VERSIONS_URL, TargetImage
 from kernelci_labgrid.labgrid import (
@@ -100,6 +103,10 @@ NODE_READ_ONLY_FIELDS = ("_id", "user")
 # Health reports without a change: at least this often, so the server (which
 # forgets devices without a report for 48 h) keeps the device
 HEARTBEAT_HOURS = 12
+
+
+class AgentLockedError(RuntimeError):
+    """Another agent holds the health state file's lock."""
 
 
 # ==================== Data Classes ====================
@@ -214,7 +221,7 @@ class HealthCheckConfig:
     timeout: int = 600
     enabled: bool = True
 
-    KEYS = ("device", "target", "frequency_hours", "firmware", "sha256", "release",
+    KEYS = ("target", "frequency_hours", "firmware", "sha256", "release",
             "test_path", "timeout", "enabled")
 
     @classmethod
@@ -226,8 +233,10 @@ class HealthCheckConfig:
         if unknown:
             raise ValueError(f"unknown health check settings: {', '.join(sorted(unknown))}")
         golden = {k: data[k] for k in ("firmware", "sha256") if data.get(k)}
-        if golden and "firmware" not in golden:
-            raise ValueError("`sha256` without `firmware`")
+        # Without sha256 the firmware cache goes by file name, and snapshot
+        # images keep theirs across builds: a stale image would boot forever
+        if golden and len(golden) != 2:
+            raise ValueError("`firmware` and `sha256` go together")
         return cls(
             device=device,
             target=data.get("target", f"{device}.yaml"),
@@ -246,14 +255,6 @@ class HealthCheckConfig:
         defaults = {k: v for k, v in table.items() if not isinstance(v, dict)}
         devices = {k: v for k, v in table.items() if isinstance(v, dict)}
         return defaults, devices
-
-    @classmethod
-    def from_toml(cls, path: Path) -> HealthCheckConfig:
-        """One device per file: `device = "..."` plus the keys above
-        (default device: the file name)."""
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
-        return cls.from_dict(data.pop("device", path.stem), data)
 
 
 # ==================== Main Agent ====================
@@ -291,7 +292,6 @@ class LabgridAgent:
         artifact_dir: str | Path | None = None,
         default_timeout: int = 3600,
         # Health check options
-        health_checks_dir: str | Path | None = None,
         health_checks: dict[str, Any] | None = None,
         health_state_file: str | Path | None = None,
         # Real hardware via the lab's labgrid-coordinator
@@ -321,11 +321,10 @@ class LabgridAgent:
             poll_interval: Seconds between API polls
             artifact_dir: Directory for downloaded artifacts
             default_timeout: Default test timeout in seconds
-            health_checks_dir: Directory with health check TOML files, one per
-                device (optional)
             health_checks: [health_checks] table of the config file: health
                 checks for all platforms of the lab ({} = defaults), plain keys
-                are settings for all, sub-tables per-device settings
+                are settings for all, sub-tables per-device settings; None: no
+                health checks
             health_state_file: JSON file to persist device health state
             coordinator: The lab's labgrid-coordinator (host:port). Enables real
                 hardware: platforms are discovered from the places' device
@@ -373,16 +372,27 @@ class LabgridAgent:
         self.worker_id = f"{lab_name}@{socket.gethostname()}"
 
         # Health check configuration
-        self.health_checks_dir = Path(health_checks_dir) if health_checks_dir else None
-        self.health_checks = health_checks  # None: only health_checks_dir
+        self.health_checks = health_checks  # None: no health checks
         self.health_state_file = Path(health_state_file) if health_state_file else None
+        # Created by the lab admin (openwrt-tests' reset-health.yml): forget
+        # all device health, check every device again
+        self.health_reset_file = (self.health_state_file.with_suffix(".reset")
+                                  if self.health_state_file else None)
+        # Held for the agent's lifetime: one agent per health state file
+        self._state_lock: int | None = None
+        # Another agent holds it: never write its file
+        self._state_locked_out = False
 
         # Runtime state
         self._session: aiohttp.ClientSession | None = None
         self._running = False
         self._stopping = False
+        # SIGHUP: claim nothing new, exit once the running work is done
+        self._draining = False
         self._stop_event = asyncio.Event()
         self._job_tasks: set[asyncio.Task] = set()
+        # Running health checks by device (place, or QEMU platform)
+        self._health_tasks: dict[str, asyncio.Task] = {}
         self._current_jobs: set[str] = set()
         self._busy_platforms: set[str] = set()
         self._health_configs: dict[str, HealthCheckConfig] = {}
@@ -397,8 +407,35 @@ class LabgridAgent:
     async def __aexit__(self, *args: Any) -> None:
         await self.stop()
 
+    def _lock_health_state(self) -> None:
+        """Lock the health state file for this agent's lifetime (flock on
+        <file>.lock), or raise AgentLockedError: another agent uses it, e.g. one
+        still finishing its jobs after a drain, or a run by hand. Each agent
+        writes the whole file from its own memory, so two would overwrite each
+        other's results. The lock goes away with the process, also on a crash."""
+        if not self.health_state_file or self._state_lock is not None:
+            return
+        path = self.health_state_file.with_name(self.health_state_file.name + ".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            self._state_locked_out = True
+            raise AgentLockedError(f"another agent uses {self.health_state_file} (lock {path}); "
+                              "stop it, or give this one its own --health-state-file") from None
+        self._state_lock = fd
+
+    def _unlock_health_state(self) -> None:
+        if self._state_lock is not None:
+            os.close(self._state_lock)  # releases the flock
+            self._state_lock = None
+
     async def start(self) -> None:
         """Start the agent."""
+        # First: nothing else may run (or write) beside another agent
+        self._lock_health_state()
         logger.info(f"Starting agent for lab: {self.lab_name}")
         logger.info(f"Tests directory: {self.tests_dir}")
         logger.info(f"Targets directory: {self.targets_dir}")
@@ -419,13 +456,10 @@ class LabgridAgent:
             # (with a coordinator, _refresh_platforms logs the list)
             logger.info(f"Platforms: {', '.join(self.platforms)}")
 
-        # Load health check configs if directory provided
-        if self.health_checks_dir or self.health_checks is not None:
+        if self.health_checks is not None:
             self._load_health_configs()
             self._load_health_state()
-            scope = "all platforms" if self.health_checks is not None else \
-                f"{len(self._health_configs)} device(s)"
-            logger.info(f"Health checks enabled: {scope}")
+            logger.info("Health checks enabled: all platforms")
 
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600))
 
@@ -445,14 +479,34 @@ class LabgridAgent:
         self._stop_event.set()
         if self._labgrid:
             self._labgrid.stopping = True
-        for task in self._job_tasks:
+        for task in self._running_tasks():
             task.cancel()
+
+    def request_drain(self) -> None:
+        """Signal handler (SIGHUP): claim no new jobs and start no health
+        checks, exit once the running ones are done. The service manager
+        starts the agent again, with new code or config."""
+        if self._draining or self._stopping:
+            return
+        self._draining = True
+        running = len(self._job_tasks) + len(self._health_tasks)
+        logger.info(f"Draining: exiting once {running} running job(s) and health check(s) are done")
+        self._stop_event.set()  # wake the poll sleep
+
+    def _running_tasks(self) -> list[asyncio.Task]:
+        return [*self._job_tasks, *self._health_tasks.values()]
+
+    async def _wait_running(self) -> None:
+        """Wait until the running jobs and health checks are done, or the
+        agent is stopped (which cancels them)."""
+        while self._running and (tasks := self._running_tasks()):
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
     async def _sleep(self, seconds: float) -> None:
         """Sleep, but wake up when the agent is stopped."""
         try:
             await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     async def stop(self) -> None:
@@ -463,11 +517,11 @@ class LabgridAgent:
         # Save health state
         self._save_health_state()
 
-        # Running jobs are cancelled and requeued; this waits for their
-        # cleanup (kill pytest, power off, unlock the place)
-        tasks = list(self._job_tasks)
+        # Running jobs are cancelled and requeued, health checks cancelled;
+        # this waits for their cleanup (kill pytest, power off, unlock the place)
+        tasks = self._running_tasks()
         if tasks:
-            logger.info(f"Cancelling {len(tasks)} running job(s)...")
+            logger.info(f"Cancelling {len(tasks)} running job(s) and health check(s)...")
             for task in tasks:
                 task.cancel()
             await asyncio.wait(tasks, timeout=120)
@@ -479,35 +533,37 @@ class LabgridAgent:
         if self._labgrid:
             await self._labgrid.close()
 
+        self._unlock_health_state()
         logger.info("Agent stopped")
 
     async def run(self, once: bool = False) -> None:
-        """Main loop - poll for jobs and run health checks.
+        """Main loop: start due health checks and claimed jobs in the
+        background, every poll_interval, until stopped or drained.
 
-        With once=True, do a single round and wait for started jobs.
+        With once=True, do a single round (health checks first, then jobs)
+        and wait for what it started.
         """
         if not self._running:
             await self.start()
 
         logger.info(f"Polling every {self.poll_interval}s")
 
-        while self._running:
+        while self._running and not self._draining:
             try:
-                # Run health checks if due
-                await self._check_health()
-
-                # Poll and execute KernelCI jobs
-                await self._poll_and_execute()
-
+                self._take_health_reset()
+                await self._check_health(wait=once)
+                if not self._draining:
+                    await self._poll_and_execute()
             except Exception as e:
                 logger.exception(f"Loop error: {e}")
 
             if once:
-                while self._current_jobs and self._running:
-                    await self._sleep(1)
                 break
-
             await self._sleep(self.poll_interval)
+
+        await self._wait_running()
+        if self._draining and self._running:
+            logger.info("Drained: no jobs or health checks running")
 
     # ==================== Health Check Methods ====================
     #
@@ -516,10 +572,9 @@ class LabgridAgent:
     # they are the server's list of this lab's devices.
 
     def _load_health_configs(self) -> None:
-        """Load health check configurations from directory."""
-        """Load per-device health checks: [health_checks.<device>] tables,
-        then health_checks_dir/*.toml (a file overrides a table). Platforms
-        without one get the [health_checks] defaults (see _health_config)."""
+        """Load per-device health checks: [health_checks.<device>] tables.
+        Platforms without one get the [health_checks] defaults (see
+        _health_config)."""
         self._health_configs.clear()
         configs = []
         defaults, devices = HealthCheckConfig.split_table(self.health_checks or {})
@@ -534,16 +589,6 @@ class LabgridAgent:
                 configs.append(HealthCheckConfig.from_dict(device, {**self._health_defaults, **values}))
             except Exception as e:
                 logger.error(f"Invalid [health_checks.{device}] settings: {e}")
-
-        if self.health_checks_dir and self.health_checks_dir.exists():
-            if any(self.health_checks_dir.glob("*.yaml")):
-                logger.warning(f"Ignoring YAML files in {self.health_checks_dir}: "
-                               "health checks are TOML now")
-            for toml_file in sorted(self.health_checks_dir.glob("*.toml")):
-                try:
-                    configs.append(HealthCheckConfig.from_toml(toml_file))
-                except Exception as e:
-                    logger.error(f"Failed to load {toml_file}: {e}")
 
         for config in configs:
             self._health_configs[config.device] = config
@@ -576,18 +621,22 @@ class LabgridAgent:
             logger.error(f"Failed to load health state: {e}")
 
     def _save_health_state(self) -> None:
-        """Persist health state to file."""
-        if not self.health_state_file:
+        """Persist health state to file: written next to it and renamed
+        over it, so the file is always complete (old or new), also if the
+        agent dies while writing."""
+        if not self.health_state_file or self._state_locked_out:
             return
 
+        tmp = self.health_state_file.with_name(self.health_state_file.name + ".tmp")
         try:
             self.health_state_file.parent.mkdir(parents=True, exist_ok=True)
             data = {
                 "updated": datetime.now().isoformat(),
                 "devices": [h.to_dict() for h in self._device_health.values()],
             }
-            with open(self.health_state_file, "w") as f:
+            with open(tmp, "w") as f:
                 json.dump(data, f, indent=2)
+            os.replace(tmp, self.health_state_file)
         except Exception as e:
             logger.error(f"Failed to save health state: {e}")
 
@@ -595,31 +644,76 @@ class LabgridAgent:
         """The labgrid places of a platform (none for QEMU)."""
         return [p for p in self._places if p.device == platform]
 
-    async def _check_health(self) -> None:
-        """Run due health checks and report every device's health: devices
-        without a check due (or without health checks) get a heartbeat. A
-        hardware platform's places are devices of their own."""
+    def _take_health_reset(self) -> None:
+        """If the reset file exists: remove it and forget all device health,
+        so every device is checked again (its result reported) right away."""
+        if not self.health_reset_file or not self.health_reset_file.exists():
+            return
+        try:
+            self.health_reset_file.unlink()
+        except OSError as e:
+            logger.error(f"Cannot remove {self.health_reset_file}: {e}")
+            return
+        logger.info("Health reset requested: checking every device again")
+        # A running check writes its own, fresh result when it is done
+        self._device_health = {d: h for d, h in self._device_health.items()
+                               if d in self._health_tasks}
+        self._save_health_state()
+
+    def _check_due(self, platform: str, place: str | None) -> bool:
+        """Does the device (a place, or a QEMU platform) need a health check?"""
+        if self._place_maintenance(place) is not None:
+            return False
+        config = self._health_config(platform)
+        health = self._device_health.get(place or platform)
+        return bool(config) and not (health and health.last_check and datetime.now()
+                                     < health.last_check + timedelta(hours=config.frequency_hours))
+
+    async def _check_health(self, wait: bool = False) -> None:
+        """Start due health checks in the background and report the other
+        devices' health (heartbeats). A hardware platform's places are
+        devices of their own. wait: also wait for the started checks.
+
+        Devices are checked in parallel. max_jobs also caps health checks,
+        counting running jobs, but one check always runs; a check that
+        doesn't fit now starts at a later poll. A QEMU platform running a job
+        is checked after it."""
         # The lab's platforms (discovered or configured), plus devices with
         # their own config when the lab has no platform list yet
         platforms = self.platforms or list(self._health_configs)
         devices = [(platform, place.name if place else None)
                    for platform in platforms
                    for place in (self._places_of(platform) or [None])]
-        # Devices are checked in parallel; max_jobs also caps health checks,
-        # counting the jobs already running (at least one check at a time)
-        limit = (asyncio.Semaphore(max(1, self.max_jobs - len(self._busy_platforms)))
-                 if self.max_jobs else None)
 
-        async def check(platform: str, place: str | None) -> None:
-            async with limit or contextlib.nullcontext():
-                if self._stopping:
-                    return
-                try:
-                    await self._check_device(platform, place)
-                except Exception:
-                    logger.exception(f"Health check of {place or platform} failed")
+        async def check(platform: str, place: str | None, run: bool = True) -> None:
+            if self._stopping:
+                return
+            try:
+                await self._check_device(platform, place, run=run)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(f"Health check of {place or platform} failed")
 
-        await asyncio.gather(*(check(platform, place) for platform, place in devices))
+        started, heartbeats = [], []
+        for platform, place in devices:
+            device = place or platform
+            if device in self._health_tasks:
+                continue  # its check is running
+            busy = place is None and platform in self._busy_platforms
+            full = (self.max_jobs and self._health_tasks
+                    and len(self._busy_platforms) + len(self._health_tasks) >= self.max_jobs)
+            if not self._check_due(platform, place) or busy:
+                heartbeats.append(check(platform, place, run=False))
+            elif not full and not self._draining and not self._stopping:
+                task = asyncio.create_task(check(platform, place))
+                self._health_tasks[device] = task
+                task.add_done_callback(lambda _, d=device: self._health_tasks.pop(d, None))
+                started.append(task)
+
+        await asyncio.gather(*heartbeats)
+        if wait and started:
+            await asyncio.wait(started)
         if self._stopping:
             return
         # Forget devices that are gone (removed places; per-platform state of
@@ -630,9 +724,9 @@ class LabgridAgent:
                 del self._device_health[name]
             self._save_health_state()
 
-    async def _check_device(self, platform: str, place: str | None) -> None:
+    async def _check_device(self, platform: str, place: str | None, run: bool = True) -> None:
         """Check one device (a place of a hardware platform, or a QEMU
-        platform) if due, else send its heartbeat."""
+        platform) if due and `run`, else send its heartbeat."""
         reason = self._place_maintenance(place)
         if reason is not None:
             await self._report_health(platform, "fail", f"maintenance: {reason}",
@@ -641,8 +735,7 @@ class LabgridAgent:
 
         config = self._health_config(platform)
         health = self._device_health.get(place or platform)
-        if config and not (health and health.last_check and datetime.now() < health.last_check
-                           + timedelta(hours=config.frequency_hours)):
+        if run and self._check_due(platform, place):
             logger.info(f"Running health check for {place or platform}")
             if await self._run_health_check(platform, config, place):
                 return  # reported
@@ -798,7 +891,7 @@ class LabgridAgent:
         if not self._session:
             return
 
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         artifacts = await self._upload_logs(f"healthcheck/{device}/{stamp}", outdir) if outdir else {}
         data: dict[str, Any] = {"platform": platform, "runtime": self.lab_name,
                                 "device": place or f"{self.lab_name}-{platform}"}
@@ -846,10 +939,6 @@ class LabgridAgent:
         if not places:
             return self._healthy(platform)  # unknown devices are assumed healthy
         return any(p.maintenance is None and self._healthy(p.name) for p in places)
-
-    def get_device_health(self, device: str) -> DeviceHealth | None:
-        """Health state of a device (place or QEMU platform)."""
-        return self._device_health.get(device)
 
     # ==================== API Methods ====================
 
@@ -925,12 +1014,15 @@ class LabgridAgent:
             await self._refresh_platforms()
 
         for platform in self.platforms:
-            if self._stopping:
+            if self._stopping or self._draining:
                 break
-            # one job per platform; max_jobs caps them all together
-            if self.max_jobs and len(self._busy_platforms) >= self.max_jobs:
+            # one job per platform; max_jobs caps them all together, running
+            # health checks included
+            if self.max_jobs and len(self._busy_platforms) + len(self._health_tasks) >= self.max_jobs:
                 break
-            if platform in self._busy_platforms:
+            # (a QEMU platform's own health check: hardware places are
+            # arbitrated by the coordinator)
+            if platform in self._busy_platforms or platform in self._health_tasks:
                 continue
 
             if not self.is_device_healthy(platform):
@@ -974,12 +1066,12 @@ class LabgridAgent:
                     continue
 
             for job in jobs:
-                if self._stopping:
+                if self._stopping or self._draining:
                     break
                 claimed = await self._claim(job)
                 if not claimed:
                     continue
-                if self._stopping:  # stopped while claiming
+                if self._stopping or self._draining:  # stopped while claiming
                     await self._unclaim(claimed)
                     break
                 self._current_jobs.add(claimed["id"])
@@ -1323,25 +1415,10 @@ class LabgridAgent:
     # ==================== Test Execution ====================
 
     def _find_target_yaml(self, platform: str) -> Path | None:
-        """Find labgrid target YAML for platform."""
-        # Try exact match first
-        candidates = [
-            self.targets_dir / f"{platform}.yaml",
-            self.targets_dir / f"{platform}.yml",
-            self.targets_dir / f"qemu-{platform}.yaml",
-            self.targets_dir / f"{platform.replace('-', '_')}.yaml",
-        ]
-
-        for path in candidates:
-            if path.exists():
-                return path
-
-        # Try glob match
-        for yaml_file in self.targets_dir.glob("*.yaml"):
-            if platform in yaml_file.stem:
-                return yaml_file
-
-        return None
+        """targets/<platform>.yaml, or None. Exact only: a near match would
+        boot a board with another board's firmware and strategy."""
+        path = self.targets_dir / f"{platform}.yaml"
+        return path if path.exists() else None
 
     def _selection(self, pytest_args: str) -> list[str]:
         """Job selection relative to tests_dir; empty = all tests.
@@ -1448,7 +1525,7 @@ class LabgridAgent:
                 )
                 try:
                     returncode = await asyncio.wait_for(proc.wait(), timeout=timeout)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     await kill_group(proc)
                     log.write(f"\nlabgrid-agent: timed out after {timeout}s\n".encode())
                 except asyncio.CancelledError:
@@ -1753,24 +1830,8 @@ class LabgridAgent:
 
     @staticmethod
     def _map_outcome(outcome: str) -> str:
-        """Map pytest/JUnit outcome to KernelCI result."""
-        mapping = {
-            "pass": "pass",
-            "fail": "fail",
-            "skip": "skip",
-            "error": "incomplete",
-            "passed": "pass",
-            "failed": "fail",
-            "skipped": "skip",
-            "xfail": "skip",
-            "xfailed": "skip",
-            "xpassed": "pass",
-        }
-        return mapping.get(outcome.lower(), "skip")
-
-
-# Keep old name for backwards compatibility
-LabgridPullAgent = LabgridAgent
+        """_parse_junit_xml's outcome -> KernelCI result (no xfail there)."""
+        return {"error": "incomplete", "xfail": "skip"}.get(outcome, outcome)
 
 
 # ==================== CLI ====================
@@ -1784,14 +1845,11 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description="KernelCI Labgrid Agent - polls for jobs & runs health checks",
-        epilog="Settings come from (later wins): a TOML config file, --env-file, "
-               "environment variables (LAB_NAME, KCI_API_URL, LAB_API_TOKEN, "
-               "KCI_STORAGE_URL, LAB_STORAGE_TOKEN, LG_COORDINATOR) and these options. The config "
-               "file is --config, $LABGRID_AGENT_CONFIG, ./labgrid-agent.toml, "
+        epilog="Settings come from a TOML config file (tokens only there), overridden by "
+               "these options. The config file is --config, ./labgrid-agent.toml, "
                "~/.config/labgrid-agent/config.toml or /etc/labgrid-agent/config.toml.",
     )
     parser.add_argument("--config", help="TOML config file (see above)")
-    parser.add_argument("--env-file", help="KEY=VALUE file with the variables above")
     parser.add_argument("--show-config", action="store_true",
                         help="Print the effective settings (secrets masked) and exit")
 
@@ -1802,23 +1860,20 @@ def main() -> None:
     parser.add_argument("--strategies-dir",
                         help="labgrid strategies imported by the targets (default: targets_dir/../strategies)")
     parser.add_argument("--api-url", help="KernelCI API URL including version")
-    parser.add_argument("--api-token", help="Lab API token")
     parser.add_argument("--storage-url", help="kernelci-storage URL for log uploads")
-    parser.add_argument("--storage-token", help="kernelci-storage JWT")
     parser.add_argument("--platform", dest="platforms", action="append",
                         help="Platform served by this lab (targets/<name>.yaml); repeatable")
     parser.add_argument("--pytest-command", help="Command to run pytest in tests_dir "
                                                  "(default: python -m pytest of this environment)")
     parser.add_argument("--artifact-dir", "-a", help="Directory for firmware and job outputs")
     parser.add_argument("--poll-interval", "-p", type=int, help="Seconds between polls (default: 30)")
-    parser.add_argument("--once", action="store_true", help="Poll once, wait for started jobs, exit")
-    parser.add_argument("--health-checks-dir", "-c",
-                        help="Directory with health check TOML files, one per device")
+    parser.add_argument("--once", action="store_true",
+                        help="Poll once, wait for started jobs and health checks, exit")
     parser.add_argument("--health-state-file", "-s", help="JSON file to persist device health state")
     parser.add_argument("--no-health-checks", dest="health_checks", action="store_const", const=False,
-                        help="No health checks for all platforms (only --health-checks-dir ones)")
+                        help="No health checks")
     parser.add_argument("--coordinator", help="The lab's labgrid-coordinator host:port (default: "
-                                              "127.0.0.1:20408 or LG_COORDINATOR; '' for QEMU only)")
+                                              "127.0.0.1:20408; '' for QEMU only)")
     parser.add_argument("--labgrid-command", help="labgrid-client command for power off "
                                                   "(default: labgrid-client of this environment)")
     parser.add_argument("--pool", help="Shared runtime to also take jobs from (e.g. openwrt-labs)")
@@ -1830,15 +1885,12 @@ def main() -> None:
     parser.add_argument("--debug", "-d", action="store_true", help="Debug logging")
 
     args = parser.parse_args()
-    meta = {"config", "env_file", "show_config", "once", "debug"}
+    meta = {"config", "show_config", "once", "debug"}
     cli = {k: v for k, v in vars(args).items() if k not in meta}
 
     config_path = find_config(args.config)
     try:
-        settings = resolve_settings(
-            cli, config_path=config_path,
-            env_file=Path(args.env_file) if args.env_file else None,
-        )
+        settings = resolve_settings(cli, config_path=config_path)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
 
@@ -1848,7 +1900,7 @@ def main() -> None:
         return
 
     for key, hint in (("lab_name", "--lab-name / lab_name"),
-                      ("api_token", "--api-token / [api] token"),
+                      ("api_token", "[api] token in the config file"),
                       ("tests_dir", "--tests-dir / tests_dir")):
         if not settings[key]:
             parser.error(f"{key} required ({hint})")
@@ -1877,7 +1929,6 @@ def main() -> None:
         pytest_command=settings["pytest_command"],
         poll_interval=int(settings["poll_interval"]),
         artifact_dir=settings["artifact_dir"],
-        health_checks_dir=settings["health_checks_dir"],
         health_checks=settings["health_checks"] if settings["health_checks"] is not False else None,
         health_state_file=settings["health_state_file"],
         coordinator=settings["coordinator"],
@@ -1891,10 +1942,16 @@ def main() -> None:
     loop = asyncio.new_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, agent.request_stop)
+    loop.add_signal_handler(signal.SIGHUP, agent.request_drain)
 
     try:
         loop.run_until_complete(agent.run(once=args.once))
         loop.run_until_complete(agent.stop())
+    except AgentLockedError as e:
+        # A service manager tries again (systemd RestartSec, procd respawn):
+        # the old agent may be finishing its jobs after a drain
+        logger.error(f"Not starting: {e}")
+        sys.exit(1)
     except KeyboardInterrupt:
         pass
     finally:

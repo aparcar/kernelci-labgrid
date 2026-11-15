@@ -1,12 +1,8 @@
 """Unit tests for the pull agent."""
 
 import pytest
-from pathlib import Path
 
-from kernelci_labgrid.scheduler.pull_agent import (
-    LabgridPullAgent,
-    TestResult,
-)
+from kernelci_labgrid.scheduler.pull_agent import LabgridAgent, TestResult
 
 
 class TestTestResult:
@@ -32,11 +28,11 @@ class TestTestResult:
         assert result.result == "skip"
 
 
-class TestLabgridPullAgent:
-    """Tests for LabgridPullAgent class."""
+class TestLabgridAgent:
+    """Tests for LabgridAgent class."""
 
     def test_initialization(self, tmp_path):
-        agent = LabgridPullAgent(
+        agent = LabgridAgent(
             api_url="https://api.example.com",
             api_token="test-token",
             lab_name="test-lab",
@@ -50,7 +46,7 @@ class TestLabgridPullAgent:
         assert agent.targets_dir == tmp_path / "targets"
 
     def test_url_trailing_slash_removed(self, tmp_path):
-        agent = LabgridPullAgent(
+        agent = LabgridAgent(
             api_url="https://api.example.com/",
             api_token="token",
             lab_name="lab",
@@ -62,7 +58,7 @@ class TestLabgridPullAgent:
         tests_dir = tmp_path / "repo" / "tests"
         tests_dir.mkdir(parents=True)
 
-        agent = LabgridPullAgent(
+        agent = LabgridAgent(
             api_url="https://api.example.com",
             api_token="token",
             lab_name="lab",
@@ -78,9 +74,9 @@ class TestFindTargetYaml:
     def test_exact_match(self, tmp_path):
         targets_dir = tmp_path / "targets"
         targets_dir.mkdir()
-        (targets_dir / "qemu-x86-64.yaml").touch()
+        (targets_dir / "qemu_x86-64.yaml").touch()
 
-        agent = LabgridPullAgent(
+        agent = LabgridAgent(
             api_url="https://api.example.com",
             api_token="token",
             lab_name="lab",
@@ -88,15 +84,18 @@ class TestFindTargetYaml:
             targets_dir=targets_dir,
         )
 
-        result = agent._find_target_yaml("qemu-x86-64")
-        assert result == targets_dir / "qemu-x86-64.yaml"
+        result = agent._find_target_yaml("qemu_x86-64")
+        assert result == targets_dir / "qemu_x86-64.yaml"
 
-    def test_glob_match(self, tmp_path):
+    @pytest.mark.parametrize("platform", ["bpi-r4", "bananapi_bpi_r4", "qemu-x86-64"])
+    def test_no_near_match(self, tmp_path, platform):
+        """A near match would boot a board with another board's target."""
         targets_dir = tmp_path / "targets"
         targets_dir.mkdir()
-        (targets_dir / "rpi4-board.yaml").touch()
+        for name in ("bananapi_bpi-r4-lite", "bananapi_bpi-r4", "qemu_x86-64"):
+            (targets_dir / f"{name}.yaml").touch()
 
-        agent = LabgridPullAgent(
+        agent = LabgridAgent(
             api_url="https://api.example.com",
             api_token="token",
             lab_name="lab",
@@ -104,15 +103,13 @@ class TestFindTargetYaml:
             targets_dir=targets_dir,
         )
 
-        result = agent._find_target_yaml("rpi4")
-        assert result is not None
-        assert "rpi4" in result.name
+        assert agent._find_target_yaml(platform) is None
 
     def test_no_match(self, tmp_path):
         targets_dir = tmp_path / "targets"
         targets_dir.mkdir()
 
-        agent = LabgridPullAgent(
+        agent = LabgridAgent(
             api_url="https://api.example.com",
             api_token="token",
             lab_name="lab",
@@ -129,7 +126,7 @@ class TestParseJunitXml:
 
     @pytest.fixture
     def agent(self, tmp_path):
-        return LabgridPullAgent(
+        return LabgridAgent(
             api_url="https://api.example.com",
             api_token="token",
             lab_name="lab",
@@ -296,29 +293,10 @@ CONSOLE    SerialDriver: root@OpenWrt:~# ubus call system board
         assert shell["properties"] == {}
 
 
-class TestMapOutcome:
-    """Tests for pytest/JUnit outcome mapping."""
-
-    def test_junit_pass(self):
-        assert LabgridPullAgent._map_outcome("pass") == "pass"
-
-    def test_junit_fail(self):
-        assert LabgridPullAgent._map_outcome("fail") == "fail"
-
-    def test_junit_skip(self):
-        assert LabgridPullAgent._map_outcome("skip") == "skip"
-
-    def test_junit_error(self):
-        assert LabgridPullAgent._map_outcome("error") == "incomplete"
-
-    def test_pytest_passed(self):
-        assert LabgridPullAgent._map_outcome("passed") == "pass"
-
-    def test_pytest_failed(self):
-        assert LabgridPullAgent._map_outcome("failed") == "fail"
-
-    def test_pytest_skipped(self):
-        assert LabgridPullAgent._map_outcome("skipped") == "skip"
-
-    def test_unknown(self):
-        assert LabgridPullAgent._map_outcome("unknown") == "skip"
+@pytest.mark.parametrize("outcome, result", [
+    ("pass", "pass"), ("fail", "fail"), ("skip", "skip"),
+    ("error", "incomplete"), ("xfail", "skip"),
+])
+def test_map_outcome(outcome, result):
+    """Every outcome _parse_junit_xml produces."""
+    assert LabgridAgent._map_outcome(outcome) == result

@@ -290,6 +290,6 @@ class Coordinator:
             _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             if proc.returncode:
                 logger.warning(f"Power off {lease.place} failed: {err.decode(errors='replace').strip()}")
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await kill_group(proc)
             logger.warning(f"Power off {lease.place} timed out")

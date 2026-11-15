@@ -1,7 +1,5 @@
 """Health checks: TOML config, golden images from the target files."""
 
-from pathlib import Path
-
 import pytest
 
 from kernelci_labgrid.config import resolve_settings
@@ -11,8 +9,6 @@ from kernelci_labgrid.scheduler.pull_agent import (
     HealthCheckConfig,
     LabgridAgent,
 )
-
-EXAMPLE = Path(__file__).parents[2] / "examples" / "health_checks" / "qemu_armsr-armv8.toml"
 
 ONE = """\
 openwrt:
@@ -103,23 +99,23 @@ def test_config_table(tmp_path):
     path = tmp_path / "lab.toml"
     path.write_text('lab_name = "lab"\n\n[health_checks]\ntimeout = 300\n\n'
                     '[health_checks.rpi-4]\nenabled = false\n')
-    table = resolve_settings({}, config_path=path, environ={})["health_checks"]
+    table = resolve_settings({}, config_path=path)["health_checks"]
     assert HealthCheckConfig.split_table(table) == ({"timeout": 300}, {"rpi-4": {"enabled": False}})
 
 
 def test_enabled_by_default(tmp_path):
-    assert resolve_settings({}, environ={})["health_checks"] == {}
+    assert resolve_settings({})["health_checks"] == {}
 
 
 @pytest.mark.parametrize("line, expected", [("true", {}), ("false", False)])
 def test_config_switch(tmp_path, line, expected):
     path = tmp_path / "lab.toml"
     path.write_text(f'health_checks = {line}\n')
-    assert resolve_settings({}, config_path=path, environ={})["health_checks"] == expected
+    assert resolve_settings({}, config_path=path)["health_checks"] == expected
 
 
 def test_cli_disables(tmp_path):
-    assert resolve_settings({"health_checks": False}, environ={})["health_checks"] is False
+    assert resolve_settings({"health_checks": False})["health_checks"] is False
 
 
 def test_defaults():
@@ -130,21 +126,12 @@ def test_defaults():
     assert check.enabled
 
 
-def test_example_file():
-    check = HealthCheckConfig.from_toml(EXAMPLE)
-    assert check.device == "qemu_armsr-armv8"
-    assert check.frequency_hours == 24
-
-
-def test_device_defaults_to_file_name(tmp_path):
-    path = tmp_path / "openwrt_one.toml"
-    path.write_text('frequency_hours = 12\n')
-    assert HealthCheckConfig.from_toml(path).device == "openwrt_one"
-
-
 @pytest.mark.parametrize("data, error", [
-    ({"sha256": "abc"}, "without `firmware`"),
+    ({"sha256": "abc"}, "go together"),
+    # no sha256: cached by file name, a stale snapshot would boot forever
+    ({"firmware": "https://x/fw.bin"}, "go together"),
     ({"golden_image": {}}, "unknown"),
+    ({"device": "x"}, "unknown"),
 ])
 def test_invalid(data, error):
     with pytest.raises(ValueError, match=error):
@@ -171,14 +158,10 @@ def test_all_platforms_with_table(tmp_path, targets):
     assert agent._health_config("rpi-4") is None
 
 
-def test_only_listed_devices_without_table(tmp_path, targets):
-    checks = tmp_path / "checks"
-    checks.mkdir()
-    (checks / "openwrt_one.toml").write_text('frequency_hours = 6\n')
-    agent = make_agent(tmp_path, targets, health_checks_dir=checks)
+def test_no_health_checks(tmp_path, targets):
+    agent = make_agent(tmp_path, targets)  # health_checks=None (--no-health-checks)
     agent._load_health_configs()
-    assert agent._health_config("openwrt_one").frequency_hours == 6
-    assert agent._health_config("enterasys_ws-ap3710i") is None
+    assert agent._health_config("openwrt_one") is None
 
 
 async def test_golden_image_from_target(tmp_path, targets, monkeypatch):

@@ -18,9 +18,7 @@ classifiers = [
     "License :: OSI Approved :: GNU Lesser General Public License v2 or later (LGPLv2+)",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Testing",
 ]
 keywords = ["kernelci", "labgrid", "testing", "embedded", "linux"]
@@ -28,14 +26,12 @@ keywords = ["kernelci", "labgrid", "testing", "embedded", "linux"]
 dependencies = [
     "aiohttp>=3.9.0",
     "pyyaml>=6.0",
-    "tomli>=2.0; python_version < '3.11'",
     # Same labgrid as openwrt-tests (talks to the lab's coordinator)
     "labgrid @ git+https://github.com/aparcar/labgrid.git@staging",
     # Run test suites like openwrt-tests from this environment (labgrid's
-    # pytest plugin comes with labgrid)
+    # pytest plugin comes with labgrid); pytest-check: openwrt-tests declares it
     "pytest>=8.4",
     "pytest-check>=2.5",
-    "pytest-harvest>=1.10",
 ]
 
 [project.optional-dependencies]
@@ -46,12 +42,10 @@ dev = [
     "pytest-json-report>=1.5.0",
     "mypy>=1.8.0",
     "ruff>=0.1.0",
-    "black>=24.0.0",
 ]
 
 [project.scripts]
 labgrid-agent = "kernelci_labgrid.scheduler.pull_agent:main"
-labgrid-pull-agent = "kernelci_labgrid.scheduler.pull_agent:main"  # backwards compat
 
 [project.urls]
 Homepage = "https://github.com/kernelci/kernelci-labgrid"
@@ -76,19 +70,15 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.13"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["E501"]
-
-[tool.black]
-line-length = 100
-target-version = ["py310", "py311", "py312"]

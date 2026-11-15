@@ -1,5 +1,1 @@
-"""Scheduler implementations for Labgrid integration."""
-
-from kernelci_labgrid.scheduler.pull_agent import LabgridAgent, LabgridPullAgent
-
-__all__ = ["LabgridAgent", "LabgridPullAgent"]
+"""The agent: kernelci_labgrid.scheduler.pull_agent."""

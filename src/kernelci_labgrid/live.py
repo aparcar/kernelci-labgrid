@@ -201,11 +201,10 @@ Upload = Callable[[str, str, bytes], Awaitable[str | None]]
 class LiveSession:
     """Uploads a job's logs and progress while it runs (see the module doc)."""
 
-    def __init__(self, upload: Upload, dest: str, *, kind: str = "test",
+    def __init__(self, upload: Upload, dest: str, *,
                  interval: float = INTERVAL_S, clock: Callable[[], float] = time.monotonic):
         self.upload = upload
         self.dest = dest  # .../live
-        self.kind = kind
         self.interval = interval
         self.clock = clock
         self.logs: dict[str, LiveLog] = {}
@@ -230,7 +229,7 @@ class LiveSession:
     def index(self) -> dict[str, Any]:
         return {
             "v": INDEX_VERSION,
-            "kind": self.kind,
+            "kind": "test",
             "updated": iso(),
             "done": self.done,
             "logs": {name: log.state() for name, log in self.logs.items()},

@@ -1,11 +1,9 @@
-"""Agent settings: TOML config file, env file, environment and CLI.
+"""Agent settings: a TOML config file and the command line.
 
-Precedence (later wins): defaults < config file < --env-file < environment
-< command line. Environment variables: LAB_NAME, KCI_API_URL, LAB_API_TOKEN,
-KCI_STORAGE_URL, LAB_STORAGE_TOKEN, LG_COORDINATOR and the paths LABGRID_TESTS_DIR,
-LABGRID_TARGETS_DIR, LABGRID_STRATEGIES_DIR, LABGRID_ARTIFACT_DIR, LABGRID_HEALTH_CHECKS_DIR,
-LABGRID_HEALTH_STATE_FILE. Example config (keys before the [api]/[storage] tables, as
-TOML assigns later keys to the table above them):
+Precedence (later wins): defaults < config file < command line. No
+environment variables: tokens belong in the (private) config file. Example
+config (keys before the [api]/[storage] tables, as TOML assigns later keys to
+the table above them):
 
     lab_name = "lynxis"
     platforms = ["qemu_armsr-armv8"]
@@ -15,7 +13,7 @@ TOML assigns later keys to the table above them):
     # poll_interval = 30
     # pytest_command: default `python -m pytest` in the agent's environment
     # coordinator = "127.0.0.1:20408"      # default; "" for a QEMU-only lab
-    # artifact_dir, targets_dir, health_checks_dir, health_state_file
+    # artifact_dir, health_state_file
 
     [api]
     url = "https://api.example.org/latest"
@@ -37,14 +35,9 @@ TOML assigns later keys to the table above them):
 from __future__ import annotations
 
 import os
-import sys
+import tomllib
 from pathlib import Path
 from typing import Any
-
-if sys.version_info >= (3, 11):
-    import tomllib
-else:  # pragma: no cover
-    import tomli as tomllib
 
 DEFAULTS: dict[str, Any] = {
     "lab_name": None,
@@ -60,11 +53,10 @@ DEFAULTS: dict[str, Any] = {
     "pytest_command": None,
     "poll_interval": 30,
     "artifact_dir": None,
-    "health_checks_dir": None,
     "health_state_file": None,
     # Health checks for all platforms by default; a [health_checks] table
     # holds settings: plain keys apply to all, [health_checks.<device>]
-    # tables per device. `health_checks = false`: only health_checks_dir
+    # tables per device. `health_checks = false`: none
     "health_checks": {},
     # Real hardware: the lab's labgrid-coordinator (host:port); "" = QEMU only
     "coordinator": "127.0.0.1:20408",
@@ -77,27 +69,7 @@ DEFAULTS: dict[str, Any] = {
 }
 
 # Settings that are paths; relative ones are resolved against the config file
-PATH_KEYS = ("tests_dir", "targets_dir", "strategies_dir", "artifact_dir", "health_checks_dir",
-             "health_state_file")
-
-# Environment variables (also the keys of --env-file), first match wins
-ENV_KEYS = {
-    "lab_name": ("LAB_NAME",),
-    "api_url": ("KCI_API_URL",),
-    "api_token": ("LAB_API_TOKEN", "KCI_API_TOKEN"),
-    "storage_url": ("KCI_STORAGE_URL",),
-    "storage_token": ("LAB_STORAGE_TOKEN",),
-    # Paths, e.g. set by the container image to its own layout
-    "tests_dir": ("LABGRID_TESTS_DIR",),
-    "targets_dir": ("LABGRID_TARGETS_DIR",),
-    "strategies_dir": ("LABGRID_STRATEGIES_DIR",),
-    "artifact_dir": ("LABGRID_ARTIFACT_DIR",),
-    "health_checks_dir": ("LABGRID_HEALTH_CHECKS_DIR",),
-    "health_state_file": ("LABGRID_HEALTH_STATE_FILE",),
-    "coordinator": ("LG_COORDINATOR",),
-    "pool": ("LAB_POOL",),
-    "max_jobs": ("LAB_MAX_JOBS",),
-}
+PATH_KEYS = ("tests_dir", "targets_dir", "strategies_dir", "artifact_dir", "health_state_file")
 
 SECRET_KEYS = ("api_token", "storage_token")
 
@@ -111,11 +83,9 @@ def default_config_paths() -> list[Path]:
 
 
 def find_config(explicit: str | None) -> Path | None:
-    """--config, else $LABGRID_AGENT_CONFIG, else the first default that exists."""
+    """--config, else the first default that exists."""
     if explicit:
         return Path(explicit)
-    if os.environ.get("LABGRID_AGENT_CONFIG"):
-        return Path(os.environ["LABGRID_AGENT_CONFIG"])
     return next((p for p in default_config_paths() if p.is_file()), None)
 
 
@@ -124,18 +94,13 @@ def load_config(path: Path) -> dict[str, Any]:
     with path.open("rb") as f:
         data = tomllib.load(f)
 
-    settings: dict[str, Any] = {}
-    # Plain keys may also live in an [agent] table
-    for source in (data, data.get("agent", {})):
-        for key, value in source.items():
-            if key in DEFAULTS:
-                settings[key] = value
+    settings = {key: value for key, value in data.items() if key in DEFAULTS}
     for table in ("api", "storage"):
         for key in ("url", "token"):
             if key in data.get(table, {}):
                 settings[f"{table}_{key}"] = data[table][key]
 
-    unknown = set(data) - set(DEFAULTS) - {"agent", "api", "storage"}
+    unknown = set(data) - set(DEFAULTS) - {"api", "storage"}
     if unknown:
         raise ValueError(f"{path}: unknown settings: {', '.join(sorted(unknown))}")
     if isinstance(settings.get("platforms"), str):
@@ -150,37 +115,11 @@ def load_config(path: Path) -> dict[str, Any]:
     return settings
 
 
-def read_env_file(path: Path) -> dict[str, str]:
-    env = {}
-    for line in path.read_text().splitlines():
-        if "=" in line and not line.lstrip().startswith("#"):
-            key, value = line.split("=", 1)
-            env[key.strip()] = value.strip()
-    return env
-
-
-def from_env(env: dict[str, str]) -> dict[str, Any]:
-    settings = {}
-    for key, names in ENV_KEYS.items():
-        value = next((env[n] for n in names if env.get(n)), None)
-        if value:
-            settings[key] = value
-    return settings
-
-
-def resolve_settings(
-    cli: dict[str, Any],
-    config_path: Path | None = None,
-    env_file: Path | None = None,
-    environ: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    """Merge all sources; `cli` holds only options given on the command line."""
+def resolve_settings(cli: dict[str, Any], config_path: Path | None = None) -> dict[str, Any]:
+    """Defaults < config file < `cli` (only the options given)."""
     settings = dict(DEFAULTS)
     if config_path:
         settings.update(load_config(config_path))
-    if env_file:
-        settings.update(from_env(read_env_file(env_file)))
-    settings.update(from_env(dict(os.environ if environ is None else environ)))
     settings.update({k: v for k, v in cli.items() if v not in (None, [])})
     return settings
 

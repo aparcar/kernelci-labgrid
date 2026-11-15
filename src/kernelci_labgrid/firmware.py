@@ -54,7 +54,7 @@ class TargetImage:
     snapshots_only: bool = False
 
     @classmethod
-    def from_target_file(cls, path: Path) -> "TargetImage":
+    def from_target_file(cls, path: Path) -> TargetImage:
         data = yaml.load(path.read_text(), Loader=_TargetLoader) or {}
         meta = data.get("openwrt") or {}
         if not meta.get("target") or not meta.get("profile"):

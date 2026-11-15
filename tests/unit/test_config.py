@@ -41,12 +41,17 @@ class TestLoadConfig:
     def test_relative_paths_against_config_file(self, config, tmp_path):
         assert load_config(config)["tests_dir"] == str(tmp_path / "openwrt-tests" / "tests")
 
-    def test_agent_table(self, tmp_path):
+    def test_platforms_string(self, tmp_path):
         path = tmp_path / "c.toml"
-        path.write_text('[agent]\nlab_name = "x"\nplatforms = "qemu_x86-64"\n')
-        s = load_config(path)
-        assert s["lab_name"] == "x"
-        assert s["platforms"] == ["qemu_x86-64"]
+        path.write_text('lab_name = "x"\nplatforms = "qemu_x86-64"\n')
+        assert load_config(path)["platforms"] == ["qemu_x86-64"]
+
+    @pytest.mark.parametrize("text", ['[agent]\nlab_name = "x"\n', 'health_checks_dir = "d"\n'])
+    def test_removed_settings_are_unknown(self, tmp_path, text):
+        path = tmp_path / "c.toml"
+        path.write_text(text)
+        with pytest.raises(ValueError, match="unknown"):
+            load_config(path)
 
     def test_unknown_key(self, tmp_path):
         path = tmp_path / "c.toml"
@@ -57,7 +62,7 @@ class TestLoadConfig:
 
 class TestResolveSettings:
     def test_defaults(self):
-        s = resolve_settings({}, environ={})
+        s = resolve_settings({})
         assert s["api_url"] == "https://api.kernelci.org/latest"
         assert s["pytest_command"] is None  # agent uses its own python -m pytest
         assert s["platforms"] == []
@@ -66,37 +71,33 @@ class TestResolveSettings:
     def test_pool(self, tmp_path):
         path = tmp_path / "c.toml"
         path.write_text('pool = "openwrt-labs"\n')
-        assert resolve_settings({}, environ={})["pool"] is None
-        assert resolve_settings({}, config_path=path, environ={})["pool"] == "openwrt-labs"
-        assert resolve_settings({}, environ={"LAB_POOL": "x"})["pool"] == "x"
+        assert resolve_settings({})["pool"] is None
+        assert resolve_settings({}, config_path=path)["pool"] == "openwrt-labs"
 
     def test_empty_coordinator_disables_hardware(self, tmp_path):
         path = tmp_path / "c.toml"
         path.write_text('coordinator = ""\nplatforms = ["qemu_x86-64"]\n')
-        assert resolve_settings({}, config_path=path, environ={})["coordinator"] == ""
+        assert resolve_settings({}, config_path=path)["coordinator"] == ""
 
-    def test_precedence(self, config, tmp_path):
-        env_file = tmp_path / "lab.env"
-        env_file.write_text("LAB_API_TOKEN=from-env-file\nLAB_NAME=from-env-file\n")
+    def test_precedence(self, config):
         s = resolve_settings(
             {"lab_name": "from-cli", "platforms": None, "poll_interval": None},
             config_path=config,
-            env_file=env_file,
-            environ={"LAB_NAME": "from-environ"},
         )
-        assert s["lab_name"] == "from-cli"           # CLI beats everything
-        assert s["api_token"] == "from-env-file"     # env file beats config
+        assert s["lab_name"] == "from-cli"             # CLI beats the file
         assert s["platforms"] == ["qemu_armsr-armv8"]  # unset CLI keeps config
         assert s["poll_interval"] == 60
 
-    def test_environ_beats_env_file(self, tmp_path):
-        env_file = tmp_path / "lab.env"
-        env_file.write_text("LAB_NAME=from-env-file\n")
-        s = resolve_settings({}, env_file=env_file, environ={"LAB_NAME": "from-environ"})
-        assert s["lab_name"] == "from-environ"
+    def test_environment_is_ignored(self, config, monkeypatch):
+        """Settings and tokens come from the TOML file only."""
+        monkeypatch.setenv("LAB_API_TOKEN", "from-environ")
+        monkeypatch.setenv("LAB_NAME", "from-environ")
+        s = resolve_settings({}, config_path=config)
+        assert s["api_token"] == "api-secret-token"
+        assert s["lab_name"] == "lynxis"
 
     def test_cli_platforms_replace_config(self, config):
-        s = resolve_settings({"platforms": ["qemu_x86-64"]}, config_path=config, environ={})
+        s = resolve_settings({"platforms": ["qemu_x86-64"]}, config_path=config)
         assert s["platforms"] == ["qemu_x86-64"]
 
 
@@ -104,27 +105,15 @@ class TestFindConfig:
     def test_explicit(self, tmp_path):
         assert find_config(str(tmp_path / "x.toml")) == tmp_path / "x.toml"
 
-    def test_environment(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("LABGRID_AGENT_CONFIG", str(tmp_path / "y.toml"))
-        assert find_config(None) == tmp_path / "y.toml"
-
     def test_working_directory(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("LABGRID_AGENT_CONFIG", raising=False)
         monkeypatch.chdir(tmp_path)
         (tmp_path / "labgrid-agent.toml").write_text("")
         assert find_config(None).name == "labgrid-agent.toml"
 
 
 def test_describe_masks_secrets(config):
-    out = describe(resolve_settings({}, config_path=config, environ={}))
+    out = describe(resolve_settings({}, config_path=config))
     assert "api-secret-token" not in out
     assert "storage-secret-token" not in out
     assert "lynxis" in out
 
-
-def test_path_environment_beats_config(config):
-    """Container images point tests_dir etc. at their own layout."""
-    s = resolve_settings({}, config_path=config,
-                         environ={"LABGRID_TESTS_DIR": "/opt/openwrt-tests/tests"})
-    assert s["tests_dir"] == "/opt/openwrt-tests/tests"
-    assert s["lab_name"] == "lynxis"

@@ -5,10 +5,8 @@
 #
 # Without --config the agent reads ./labgrid-agent.toml,
 # ~/.config/labgrid-agent/config.toml or /etc/labgrid-agent/config.toml.
-# Precedence (later wins): this file < --env-file < environment variables
-# (LAB_NAME, KCI_API_URL, LAB_API_TOKEN, KCI_STORAGE_URL, LAB_STORAGE_TOKEN,
-# LG_COORDINATOR, LAB_POOL, LABGRID_* paths)
-# < command line options.
+# Command line options override this file; environment variables aren't read.
+# The tokens below only go here: keep this file private.
 #
 # On openwrtci, Ansible generates a ready-to-use file per lab
 # (ansible/secrets/<server>/labs/<lab>.toml). Keep it secret: it holds tokens.
@@ -20,12 +18,12 @@ lab_name = "my-lab"
 
 # The lab's own labgrid-coordinator. Its places' `device=<platform>` tags
 # are the hardware platforms this lab serves; places are reserved and locked
-# per job (LG_COORDINATOR also works). Leave unset for a QEMU-only lab.
+# per job. "" for a QEMU-only lab.
 coordinator = "127.0.0.1:20408"
 
 # Shared job pool (a runtime all participating labs are members of). Jobs
 # scheduled to the pool go to whichever lab with the platform claims them
-# first; jobs for lab_name itself are taken first (LAB_POOL also works).
+# first; jobs for lab_name itself are taken first.
 # pool = "openwrt-labs"
 
 # Optional: restrict the discovered hardware platforms, and add local QEMU
@@ -36,7 +34,7 @@ coordinator = "127.0.0.1:20408"
 # The test suite (pytest tests incl. conftest.py), the labgrid target files
 # and the labgrid strategies they import. They can live anywhere; relative
 # paths are relative to this file. pytest runs in tests_dir with the agent's
-# own Python, which includes labgrid, pytest-check and pytest-harvest.
+# own Python, which includes labgrid and pytest-check.
 tests_dir = "openwrt-tests/tests"
 targets_dir = "openwrt-tests/targets"     # default: <tests_dir>/../targets
 # strategies_dir = "openwrt-tests/strategies"   # default: <targets_dir>/../strategies
@@ -47,7 +45,6 @@ targets_dir = "openwrt-tests/targets"     # default: <tests_dir>/../targets
 # reserve_timeout = 60                     # seconds to wait for a free place
 # poll_interval = 30                       # seconds between polls
 # artifact_dir = "/var/lib/labgrid-agent/artifacts"   # default: a temp dir
-# health_checks_dir = "/etc/labgrid-agent/health_checks"   # *.toml, one per device
 # health_state_file = "/var/lib/labgrid-agent/health.json"  # keeps results across restarts
 # health_checks = false                    # no health checks (default: all platforms)
 
@@ -68,6 +65,10 @@ token = "<lab storage token>"
 # [health_checks]
 # frequency_hours = 24
 # release = "25.12.5"          # unless the target pins healthcheck_version
+#
+# [health_checks.openwrt_one]  # explicit golden image: firmware and sha256
+# firmware = "https://example.org/known-good.itb"
+# sha256 = "…"
 #
 # [health_checks.rpi-4]
 # enabled = false
