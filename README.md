@@ -168,6 +168,11 @@ file is written to `health.json.tmp` and renamed, so it is never half written.
 Failures where tests never ran (download, crash, timeout) mark the job
 `incomplete` with `error_code: Infrastructure`. Firmware that never reaches a
 shell (pytest exit code 3) is a real `fail`, not an infrastructure error.
+If `test_shell` passed and the shell was lost later (a test ended the system
+and it did not come back), the run was cut short: the boot node stays `pass`,
+the job's `misc.summary` gets `aborted: true` and `aborted_after:
+"<module>::<test>"` (the last test that ran), and `error_msg` says "lost the
+shell after <module>::<test> (session aborted after N tests)".
 
 Ctrl-C (SIGINT/SIGTERM) stops right away: running jobs are cancelled (pytest
 and QEMU killed, the place powered off and unlocked) and given back to the

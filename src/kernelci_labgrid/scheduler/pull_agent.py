@@ -158,6 +158,16 @@ class TestResult:
             return "fail"
         return "pass" if self.passed else "incomplete"
 
+    @property
+    def aborted_after(self) -> str | None:
+        """The shell was lost after the first boot (test_shell) passed: the
+        session was cut short after this test, "<module>::<test>" (the last
+        one in the JUnit XML that was not skipped). None otherwise."""
+        if self.returncode != PYTEST_RC_NO_SHELL or self.boot_result != "pass":
+            return None
+        last = [tc for tc in self.test_cases if tc["result"] != "skip"][-1]
+        return f"{last['module']}::{last['name']}"
+
 
 @dataclass
 class DeviceHealth:
@@ -1735,7 +1745,11 @@ class LabgridAgent:
                                      "xfailed": result.xfailed,
                                      "boot": result.boot_result,
                                  }}}
-        if result.returncode == PYTEST_RC_NO_SHELL:
+        if result.aborted_after:
+            node["data"]["misc"]["summary"].update(aborted=True, aborted_after=result.aborted_after)
+            node["data"]["error_msg"] = (f"lost the shell after {result.aborted_after} "
+                                         f"(session aborted after {result.total} tests)")
+        elif result.returncode == PYTEST_RC_NO_SHELL:
             node["data"]["error_msg"] = "firmware did not reach a shell"
         elif node["result"] == "incomplete":
             node["data"]["error_code"] = "Infrastructure"

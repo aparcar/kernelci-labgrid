@@ -212,6 +212,34 @@ class TestBuildHierarchy:
         h = agent._build_hierarchy(JOB, TestResult(returncode=PYTEST_RC_NO_SHELL), {})
         assert h["node"]["result"] == "fail"
         assert "error_code" not in h["node"]["data"]
+        assert h["node"]["data"]["error_msg"] == "firmware did not reach a shell"
+        assert "aborted" not in h["node"]["data"]["misc"]["summary"]
+
+    def test_no_shell_after_boot_is_aborted(self, agent):
+        """test_shell passed, a later test lost the shell: the session was
+        cut short, the first boot still passed."""
+        result = TestResult(passed=2, skipped=1, total=3, returncode=PYTEST_RC_NO_SHELL, test_cases=[
+            case("base", "test_shell", "pass"),
+            case("system", "test_reboot", "pass"),
+            case("wifi", "test_ap", "skip"),
+        ])
+        h = agent._build_hierarchy(JOB, result, {})
+
+        node = h["node"]
+        assert node["result"] == "fail"
+        assert node["data"]["error_msg"] == (
+            "lost the shell after system::test_reboot (session aborted after 3 tests)")
+        assert node["data"]["misc"]["summary"] == {
+            "total": 3, "passed": 2, "failed": 0, "errors": 0, "skipped": 1, "xfailed": 0,
+            "boot": "pass", "aborted": True, "aborted_after": "system::test_reboot"}
+        assert result.boot_result == "pass"
+
+    def test_no_shell_with_failed_test_shell(self, agent):
+        result = TestResult(failed=1, total=1, returncode=PYTEST_RC_NO_SHELL,
+                            test_cases=[case("base", "test_shell", "fail")])
+        h = agent._build_hierarchy(JOB, result, {})
+        assert h["node"]["data"]["error_msg"] == "firmware did not reach a shell"
+        assert "aborted" not in h["node"]["data"]["misc"]["summary"]
 
 
 class TestClaim:
