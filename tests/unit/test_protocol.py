@@ -1,5 +1,7 @@
 """Unit tests for the KernelCI API protocol side of the agent."""
 
+import asyncio
+
 import pytest
 
 from kernelci_labgrid.scheduler.pull_agent import (
@@ -332,6 +334,27 @@ class TestClaim:
         agent._busy_platforms.add("qemu_x86-64")  # one job already running
         await agent._poll_and_execute()
         assert "get" not in calls
+
+    async def test_platforms_take_turns(self, agent, monkeypatch):
+        agent.platforms = ["qemu_c", "qemu_a", "qemu_b"]
+        agent.max_jobs = 1
+        started = []
+
+        async def fake_get(endpoint, **params):
+            return {"items": [dict(JOB, id=params["data.platform"])]}
+
+        async def fake_claim(job):
+            return job
+
+        monkeypatch.setattr(agent, "_api_get", fake_get)
+        monkeypatch.setattr(agent, "_claim", fake_claim)
+        monkeypatch.setattr(agent, "_execute_job", lambda job, lease=None: _record(started, job))
+        for _ in range(4):
+            await agent._poll_and_execute()
+            agent._busy_platforms.clear()  # the job finished
+            agent._current_jobs.clear()
+        await asyncio.sleep(0)
+        assert [j["id"] for j in started] == ["qemu_a", "qemu_b", "qemu_c", "qemu_a"]
 
     async def test_unhealthy_platform_not_polled(self, agent, api):
         from kernelci_labgrid.scheduler.pull_agent import DeviceHealth

@@ -405,6 +405,8 @@ class LabgridAgent:
         self._health_tasks: dict[str, asyncio.Task] = {}
         self._current_jobs: set[str] = set()
         self._busy_platforms: set[str] = set()
+        # The platform that took the last job: polls start after it
+        self._last_claimed = ""
         self._health_configs: dict[str, HealthCheckConfig] = {}
         self._health_defaults: dict[str, Any] = {}
         self._device_health: dict[str, DeviceHealth] = {}
@@ -1023,7 +1025,9 @@ class LabgridAgent:
         if self._labgrid:
             await self._refresh_platforms()
 
-        for platform in self.platforms:
+        # Round robin: with max_jobs, a fixed order lets the first platforms
+        # take every free slot while the last ones' jobs time out
+        for platform in sorted(self.platforms, key=lambda p: (p <= self._last_claimed, p)):
             if self._stopping or self._draining:
                 break
             # one job per platform; max_jobs caps them all together, running
@@ -1086,6 +1090,7 @@ class LabgridAgent:
                     break
                 self._current_jobs.add(claimed["id"])
                 self._busy_platforms.add(platform)
+                self._last_claimed = platform
                 task = asyncio.create_task(self._execute_job(claimed, lease))
                 self._job_tasks.add(task)
                 task.add_done_callback(self._job_tasks.discard)
